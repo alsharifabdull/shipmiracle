@@ -1,0 +1,101 @@
+# Actions are pinned by full commit SHA (the version tag is in the comment on each line; resolved read-only with `gh api` on 21 Oct 2026).
+# To update one: look up the new tag's commit SHA, replace both the SHA and the comment, and run tests/private/release_data_test.py.
+# No secrets are used anywhere in this file; the token is read-only and is not kept in the checkout (persist-credentials: false).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # macOS is first-class (used daily); Linux is experimental (tested here and in a local container: bin/test-linux). Python 3.9 is the floor, 3.12 the current.
+    name: test (${{ matrix.os }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"        # a pinned major, not the floating alias lts/*; change it here on purpose (DECISIONS 2026-10-22 D9 m8)
+      - name: Fingerprint the runner's real settings (before)
+        run: |
+          set -eu
+          mkdir -p "$HOME/.claude" "$HOME/.config/shipmiracle"
+          { find "$HOME/.claude" -maxdepth 1 -name 'settings*.json' -type f; find "$HOME/.config/shipmiracle" -type f; } | sort | while IFS= read -r f; do shasum -a 256 "$f"; done > "$RUNNER_TEMP/real-before.sha"
+          cat "$RUNNER_TEMP/real-before.sha"
+          echo "fingerprinted $(wc -l < "$RUNNER_TEMP/real-before.sha" | tr -d ' ') real file(s)"
+      - name: Settings isolation test
+        run: python3 tests/settings_isolation_test.py
+      - name: Run all suites
+        run: SHIPMIRACLE_TEST=1 bin/test-all
+      - name: Fail if a test changed the runner's real settings (after)
+        if: always()
+        run: |
+          set -eu
+          { find "$HOME/.claude" -maxdepth 1 -name 'settings*.json' -type f; find "$HOME/.config/shipmiracle" -type f; } | sort | while IFS= read -r f; do shasum -a 256 "$f"; done > "$RUNNER_TEMP/real-after.sha"
+          if ! diff -u "$RUNNER_TEMP/real-before.sha" "$RUNNER_TEMP/real-after.sha"; then
+            echo "FAIL: a test run changed ~/.claude/settings*.json or ~/.config/shipmiracle (see the diff above)"; exit 1
+          fi
+          echo "real settings unchanged"
+
+  windows-refusal:
+    # Native Windows is not supported yet: Shipmiracle must refuse with one "use WSL2" message and change nothing. This is the only check that runs there.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Native Windows refuses with the WSL2 message
+        shell: bash
+        run: python tests/windows_refusal_test.py
+
+  release-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.9"
+      - name: Install gitleaks
+        # Accepted float (DECISIONS 2026-10-22 D9 m8): Homebrew has no version pin for a formula; the scan result is checked by --require-gitleaks and the findings are read, not trusted blindly.
+        run: brew install gitleaks
+      - name: Scan the tree
+        run: bin/shipm release-check --tree . --no-denylist --require-gitleaks
+
+  shellcheck:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install shellcheck
+        # Accepted float (DECISIONS 2026-10-22 D9 m8): Homebrew has no version pin for a formula; shellcheck only reads the scripts (no secrets, no network use after install).
+        run: brew install shellcheck
+      - name: Check shell scripts
+        run: |
+          set -eu
+          list=$(mktemp)
+          git ls-files bin hooks .githooks 'templates/**/hooks/*' | while IFS= read -r f; do
+            if head -n 1 "$f" | grep -Eq '^#!.*[/ ](ba)?sh( |$)'; then printf '%s\n' "$f"; fi
+          done > "$list"
+          cat "$list"
+          xargs shellcheck --severity=warning < "$list"

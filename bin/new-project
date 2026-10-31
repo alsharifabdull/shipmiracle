@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# new-project <name> [--type web|ios|python|api|home|notes|other] [--about TEXT] [--playbook TYPE|none] [--no-github] [--open] [--no-open]
+# Creates <projects folder>/<name> (config paths.projects_dir, default ~/Developer) from the templates, the team roles (copied into the project in the legacy layout; none in the user-level layout), the shared
+# skills, a Git repo with a first commit, a private GitHub repo. It opens no window by default (the project is already listed in the
+# Shipmiracle panel); --open runs `code -r <dir>` (replaces the current window) for terminal users. --no-open is a no-op alias.
+# After the first commit it sets the playbook type (shipm playbook set type T; web/api/python/other->software, ios/home->app, notes->notes) so the timeline shows;
+# --playbook TYPE picks another playbook type, --playbook none skips it. A failed playbook step only warns. Idempotent: running it again only adds missing files.
+set -euo pipefail
+WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+name=""; type="web"; about=""; github=1; open=0; playbook=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type) type="$2"; shift 2;;
+    --about) [[ $# -ge 2 ]] || { echo "--about needs a text" >&2; exit 2; }; about="$2"; shift 2;;
+    --playbook) [[ $# -ge 2 ]] || { echo "--playbook needs a type or none" >&2; exit 2; }; playbook="$2"; shift 2;;
+    --no-github) github=0; shift;;
+    --open) open=1; shift;;
+    --no-open) open=0; shift;;
+    -h|--help) sed -n 2,5p "$0"; exit 0;;
+    *) name="$1"; shift;;
+  esac
+done
+[[ -n "$name" ]] || { echo "usage: new-project <name> [--type web|ios|python|api|home|notes|other] [--about TEXT]" >&2; exit 2; }
+# Python always reads and writes UTF-8 here, whatever the caller's locale (a C locale would otherwise break non-ASCII text).
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+# The purpose goes into CLAUDE.md mid-line, where Claude reads "@path" as an import anywhere: so the text is made inert.
+# One line; every @ becomes the fullwidth form; no leading # or @; "<!--", "{{" and the standards heading are broken up; at most 140 CHARACTERS.
+about=$(python3 -c '
+import re, sys
+t = sys.argv[1].encode("utf-8", "ignore").decode("utf-8")
+t = re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", " ", t)
+t = t.replace("@", "\uff20").replace("<!--", "< !--").replace("{{", "{ {").replace("## 1. Before any work", "1. Before any work")
+t = re.sub(r"^[#\uff20 ]+", "", t)
+sys.stdout.write(t[:140].strip())' "$about")
+# tidy the name: "My App 2" -> "my-app-2"
+name=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^[-.]+//' | cut -c1-40 | sed -E 's/[-.]+$//')   # same rule as the panel: [a-z0-9._-], no leading [-.] or trailing [-.], at most 40
+case "$name" in __proto__|constructor|prototype) echo "'$name' is a reserved name; please pick another." >&2; exit 2;; esac
+[[ -n "$name" ]] || { echo "Please give the project a name with at least one letter or digit." >&2; exit 2; }
+# The projects folder: config paths.projects_dir (~/... follows $HOME; an absolute path is used only for the real account home), else ~/Developer.
+real_home=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+pd=$("$WS/bin/shipm" config get paths.projects_dir 2>/dev/null || true); DEVDIR="$HOME/Developer"
+case "$pd" in "~/"?*) DEVDIR="$HOME/${pd#\~/}";; /?*) [[ "$HOME" == "$real_home" ]] && DEVDIR="$pd";; esac
+ENGINE=$("$WS/bin/shipm" config get engine.dir 2>/dev/null || true); { [[ -n "$ENGINE" && "$ENGINE" != null ]] || ENGINE="$WS"; }
+[[ -d "$DEVDIR/$name" && -f "$DEVDIR/$name/CLAUDE.md" ]] && echo "note: $name already exists; adding only missing files."
+case "$playbook" in ""|none|software|app|content|research|ops|notes) ;; *) echo "unknown playbook type: $playbook (software, app, content, research, ops, notes, none)" >&2; exit 2;; esac
+[[ -d "$WS/templates/$type" ]] || { echo "unknown type: $type (web, ios, python, api, home, notes, other)" >&2; exit 2; }
+dir="$DEVDIR/$name"; date=$(date +%Y-%m-%d)
+created=0; [[ -e "$dir" ]] || created=1
+fresh=$created     # this run makes the folder: no chat can be open in it yet (used for the playbook step)
+# if building the folder fails before it is complete, remove what this run created (never a folder that existed before)
+cleanup() { local rc=$?; [[ $rc -ne 0 && $rc -ne 3 && $created -eq 1 && -n "$dir" && "$dir" == "$DEVDIR/"?* ]] && { rm -rf "$dir"; echo "new-project failed; removed the half-made folder $dir" >&2; }; return 0; }
+trap cleanup EXIT
+mkdir -p "$dir"
+
+# copy without overwriting (project's own edits win)
+copy_missing() { # src dst
+  (cd "$1" && find . -type f -o -type l) | while read -r f; do
+    [[ -e "$2/$f" ]] && continue
+    mkdir -p "$2/$(dirname "$f")"; cp -P "$1/$f" "$2/$f"
+  done
+}
+copy_missing "$WS/templates/base" "$dir"
+copy_missing "$WS/templates/$type" "$dir"
+mkdir -p "$dir/.agents/skills"
+# the team: layout "userlevel" keeps it in ~/.claude/agents (shipm agents install); "legacy" (default) copies the masters into the project
+layout=$("$WS/bin/shipm" config get agents.layout 2>/dev/null || echo legacy)
+if [[ "$layout" != userlevel ]]; then mkdir -p "$dir/.claude/agents"; copy_missing "$WS/agents/claude" "$dir/.claude/agents"; fi
+copy_missing "$WS/skills"        "$dir/.agents/skills"
+[[ -e "$dir/.claude/skills" ]] || ln -s ../.agents/skills "$dir/.claude/skills"
+chmod +x "$dir"/.claude/hooks/*.sh "$dir"/.githooks/* 2>/dev/null
+[[ "$type" == ios ]] && rm -rf "$dir/.github"   # no paid macOS CI
+mkdir -p "$dir/docs/memory" "$dir/docs/plans"
+
+# fill placeholders and put the managed standard block (docs/standards/base.md) into CLAUDE.md; on-demand files into docs/standards/
+python3 - "$dir" "$name" "$type" "$date" "$WS" "$about" "$ENGINE" <<'PY'
+import pathlib, sys, re
+d, name, typ, date, ws, about, engine = sys.argv[1:]
+sys.path.insert(0, ws)
+from shipmiracle import standard
+root = pathlib.Path(d)
+base = standard.base_text(ws)
+frag = root / "CLAUDE.fragment.md"
+cm = root / "CLAUDE.md"
+# an existing, unmigrated project (AGENTS.md without the managed block in CLAUDE.md) keeps its rules: no fragment, no refresh, no docs/standards
+unmigrated = (root / "AGENTS.md").is_file() and "SHIPMIRACLE-STANDARD BEGIN" not in (cm.read_text(encoding="utf-8", errors="replace") if cm.is_file() else "")
+for p in [root/"CLAUDE.md", root/"docs/STATUS.md", root/"docs/DECISIONS.md", root/"docs/SKILLS.md", root/"docs/FEATURE-IDEAS.md"]:
+    if not p.exists(): continue
+    if unmigrated and p.name == "CLAUDE.md": continue
+    t = p.read_text(encoding="utf-8")
+    t = t.replace("{{PROJECT_NAME}}", name).replace("{{DATE}}", date).replace("{{STACK}}", typ)
+    t = t.replace("{{PURPOSE}}", about or "(fill in)")
+    if p.name == "CLAUDE.md":
+        t = standard.refresh(t, base)
+        if frag.exists() and frag.read_text().splitlines()[0] not in t:
+            t = t.rstrip() + "\n\n" + frag.read_text()
+    p.write_text(t, encoding="utf-8")
+if not unmigrated:
+    sd = root / "docs" / "standards"; sd.mkdir(parents=True, exist_ok=True)
+    for fn, text in standard.on_demand_files(ws).items():
+        (sd / fn).write_text(text, encoding="utf-8")
+if frag.exists(): frag.unlink()
+# hook and command files carry @SHIPMIRACLE_ENGINE@ for the engine folder (apply-template does the same when it refreshes them)
+for pat in (".claude/hooks/*.sh", ".claude/commands/*.md", ".githooks/*"):
+    for f in root.glob(pat):
+        try:
+            b = f.read_bytes()
+        except OSError:
+            continue
+        if b"@SHIPMIRACLE_ENGINE@" in b and f.is_file() and not f.is_symlink():
+            f.write_bytes(b.replace(b"@SHIPMIRACLE_ENGINE@", engine.encode("utf-8")))
+PY
+created=0          # the folder is complete from here on: later steps never delete it
+
+find "$dir" -name extensions.stack.json -delete; python3 "$WS/bin/vscode-recs" "$dir" >/dev/null
+cd "$dir"
+[[ -d .git ]] || git init -q -b main
+# the registry is written only for the real account home (Shipmiracle ignores $HOME): a run with a fake HOME (tests) must not touch the real one
+if [[ "${SHIPMIRACLE_TEST:-}" == 1 || "$HOME" == "$real_home" ]]; then
+  "$WS/bin/shipm" registry sync >/dev/null 2>&1 && echo "Registry: project listed (team on)" || echo "note: project registry not updated (run: shipm registry sync)"
+else echo "note: HOME is not the account home; project registry not updated (run: shipm registry sync)"; fi
+git config core.hooksPath .githooks          # auto-push after every commit; STATUS check before commit
+git add -A
+git diff --cached --quiet || git commit -q --no-verify -m "Project created from the Shipmiracle template ($type)"
+# the playbook (the timeline shows only with one). An existing playbook is left alone unless --playbook is given. Fail-soft: a failure warns, the project stays.
+pbtype="$playbook"
+if [[ -z "$pbtype" ]]; then
+  case "$type" in ios|home) pbtype=app;; notes) pbtype=notes;; *) pbtype=software;; esac
+  [[ -f "$dir/.shipmiracle/playbook.json" ]] && pbtype=none
+fi
+if [[ "$pbtype" != none && "${SHIPMIRACLE_TEST:-}" != 1 && "$HOME" != "$real_home" ]]; then
+  echo "note: HOME is not the account home; playbook not set (run: shipm playbook set type $pbtype --project $name)"   # like the registry: a fake HOME must not write the real one
+elif [[ "$pbtype" != none ]]; then
+  pb_extra=(); [[ $fresh -eq 1 ]] && pb_extra=(--allow-open-chat)
+  if pb_out=$("${SHIPMIRACLE_SHIPM:-$WS/bin/shipm}" playbook set type "$pbtype" --project "$name" ${pb_extra[@]+"${pb_extra[@]}"} 2>&1 </dev/null); then echo "Playbook: type $pbtype set (timeline on)"
+  else echo "warning: playbook not set ($(printf '%s' "$pb_out" | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-160)); run: shipm playbook set type $pbtype --project $name" >&2; fi
+fi
+# prettier: the generated .shipmiracle/ folder (playbook.json) must not be checked by the project's formatter (CI `prettier --check .` would warn).
+# Only when the project uses prettier (package.json or a prettier config): one line in .prettierignore plus one Updated line in docs/STATUS.md (the project's pre-commit hook
+# counts .prettierignore as source and needs STATUS staged), one commit of just those two files, never --no-verify. Fail-soft: a failure warns, the project stays.
+pi_py="$WS/shipmiracle/prettier_ignore.py"
+pi_note="add the line .shipmiracle/ to $dir/.prettierignore yourself"
+if [[ ! -f "$pi_py" ]]; then echo "warning: prettier ignore not checked ($pi_py not found); $pi_note" >&2
+elif ! pi_out=$(python3 -I "$pi_py" commit "$dir" --git git 2>&1 </dev/null); then echo "warning: prettier ignore not set ($(printf '%s' "$pi_out" | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-160)); $pi_note" >&2
+else
+  case "$pi_out" in
+    "committed "*) echo "Prettier: .shipmiracle/ added to .prettierignore (commit ${pi_out#committed })" ;;
+    "skipped "*) echo "warning: prettier ignore not set (${pi_out#skipped }); $pi_note" >&2 ;;
+  esac
+fi
+gh_problem=""      # set when GitHub is not set up: printed to stderr at the end, exit 3 (the local project is complete)
+if [[ $github -eq 1 ]]; then
+  if ! command -v gh >/dev/null; then gh_problem="GitHub: skipped - gh is not installed (install it, then run 'gh repo create $name --private --source=. --push' in $dir)"
+  elif ! gh auth status >/dev/null 2>&1; then gh_problem="GitHub: skipped - not logged in (run 'gh auth login' then 'gh repo create $name --private --source=. --push' in $dir)"
+  elif git remote get-url origin >/dev/null 2>&1; then echo "GitHub: remote origin already set"
+  elif gh_out=$(gh repo create "$name" --private --source=. --remote=origin --push ${about:+--description "$about"} 2>&1 >/dev/null); then echo "GitHub: private repo $name created and pushed"
+  else gh_problem="GitHub: FAILED - $(printf '%s' "$gh_out" | tr '\r' '\n' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | grep -v '^$' | tail -n 1 | cut -c1-200)"
+  fi
+fi
+echo "Project ready: $dir  (type: $type)"
+echo "Next: open it, read docs/STATUS.md, fill the Project section of CLAUDE.md."
+if [[ $open -eq 1 ]]; then command -v code >/dev/null && code -r "$dir" || true
+else echo "Open it from the Shipmiracle panel: it is already listed there"; fi
+[[ -z "$gh_problem" ]] || { echo "$gh_problem" >&2; exit 3; }

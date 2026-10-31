@@ -1,0 +1,54 @@
+#!/bin/bash
+# shipm-chat <name> [nonce [prompt-hash]]: start (or continue) a project's Claude chat. Run in the project folder (the terminal's cwd).
+# The panel launches it as `/bin/bash -p shipm-chat ...` (-p: BASH_ENV, SHELLOPTS and exported functions are ignored).
+# The panel used to decide --continue when it CREATED the terminal; VS Code replays those saved args after a restart,
+# so a chat created before any history existed started a new conversation on every restart. This decides at every launch.
+# One-shot files the panel writes (mode 600, created exclusively) just before creating the terminal, named with a random nonce that is
+# also this script's 2nd argument: chat-fresh.<name>.<nonce> (start a new conversation once), chat-prompt.<name>.<nonce> (its content is
+# the first message; used ONLY when its sha256 starts with the 3rd argument, so a swapped file is ignored). They are read and deleted
+# FIRST, before anything can fail; a replay after a restart finds them gone. Files older than 2 minutes are never used (and are deleted).
+# SHIPMIRACLE_CLAUDE / SHIPMIRACLE_STATE / SHIPMIRACLE_CLAUDE_PROJECTS only count when SHIPMIRACLE_TEST=1.
+ORIG_PATH="${PATH:-}"        # claude must get exactly the PATH the terminal had (node, gh, homebrew tools...); restored right before the exec
+PATH=/usr/bin:/bin            # the wrapper's own commands run with this one
+name="${1:-}"; nonce="${2:-}"; phash="${3:-}"
+STATE="$HOME/.local/state/shipmiracle"; PROJECTS="$HOME/.claude/projects"; CLAUDE="$HOME/.local/bin/claude"
+# sha256 of stdin, absolute paths only: macOS ships shasum; many Linux images ship only sha256sum (same hex output)
+if [[ -x /usr/bin/shasum ]]; then SHA256="/usr/bin/shasum -a 256"; elif [[ -x /usr/bin/sha256sum ]]; then SHA256="/usr/bin/sha256sum"; else SHA256="/usr/bin/shasum -a 256"; fi
+if [[ "${SHIPMIRACLE_TEST:-}" == "1" ]]; then STATE="${SHIPMIRACLE_STATE:-$STATE}"; PROJECTS="${SHIPMIRACLE_CLAUDE_PROJECTS:-$PROJECTS}"; CLAUDE="${SHIPMIRACLE_CLAUDE:-$CLAUDE}"; fi
+valid=1; [[ -n "$name" && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$name" != *..* ]] || valid=0
+if [[ -n "$nonce" && ! "$nonce" =~ ^[0-9a-f]{16}$ ]]; then echo "shipm-chat: bad launch token" >&2; exit 2; fi
+badtoken=0; if [[ -n "$phash" && ! "$phash" =~ ^[0-9a-f]{32}$ ]]; then badtoken=1; phash=""; fi      # reported after the one-shot files are consumed
+fresh=0; prompt=""; have_prompt=0
+if [[ $valid == 1 ]]; then
+  # leftovers of earlier launches (never consumed) older than 2 minutes
+  /usr/bin/find "$STATE" -maxdepth 1 \( -name "chat-fresh.$name.*" -o -name "chat-prompt.$name.*" \) -type f -mmin +2 -delete 2>/dev/null
+fi
+if [[ -n "$nonce" && "$name" != */* ]]; then
+  ff="$STATE/chat-fresh.$name.$nonce"; pf="$STATE/chat-prompt.$name.$nonce"
+  if [[ $valid == 1 ]]; then
+    if [[ -f "$ff" && ! -L "$ff" && -O "$ff" ]]; then fresh=1; fi
+    if [[ -f "$pf" && ! -L "$pf" && -O "$pf" ]]; then
+      if [[ -z "$phash" ]]; then echo "shipm-chat: prompt file without a token ignored" >&2
+      else
+        got="$(/bin/cat "$pf" 2>/dev/null; printf x)"; got="${got%x}"          # read once; the hash is checked on exactly what is used
+        sum="$(printf '%s' "$got" | $SHA256 | /usr/bin/cut -c1-32)"
+        if [[ "$sum" == "$phash" && -n "$got" ]]; then prompt="$got"; have_prompt=1; else echo "shipm-chat: prompt file did not match its token; ignored" >&2; fi
+      fi
+    fi
+  fi
+  /bin/rm -f "$ff" "$pf"                             # consumed (also when the name is bad or claude is missing below)
+fi
+if [[ $badtoken == 1 ]]; then echo "shipm-chat: bad prompt token" >&2; exit 2; fi
+if [[ $valid == 0 ]]; then echo "shipm-chat: bad or missing chat name (letters, digits, . _ - ; not starting with - or .)" >&2; exit 2; fi
+if [[ ! -x "$CLAUDE" ]]; then echo "shipm-chat: claude not found (expected at ~/.local/bin/claude)" >&2; exit 127; fi
+args=()
+if [[ $fresh == 0 ]]; then
+  # one '-' per character (Claude Code's folder naming), whatever locale the terminal was started with
+  key="$(pwd -P | LC_ALL=en_US.UTF-8 /usr/bin/sed 's/[^A-Za-z0-9]/-/g')"
+  if compgen -G "$PROJECTS/$key/*.jsonl" >/dev/null 2>&1; then args+=(--continue); fi
+fi
+args+=(--model opusplan --name "$name" --remote-control "$name")
+if [[ $have_prompt == 1 ]]; then args+=(-- "$prompt"); fi
+[[ -n "$ORIG_PATH" ]] || ORIG_PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin"
+export PATH="$ORIG_PATH"
+exec "$CLAUDE" "${args[@]}"

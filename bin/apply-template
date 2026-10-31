@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# apply-template <project-dir> — bring an existing project up to the current template, safely.
+# Adds/refreshes: .claude/hooks/*, .githooks/* (+ core.hooksPath), .claude/settings.json keys
+# (model, autoMemoryDirectory, hooks), roles (.claude/agents) from the masters (legacy layout only; user-level layout copies nothing),
+# docs/memory + docs/plans, and migrates this project's Claude auto-memory from ~/.claude into
+# docs/memory once. Never touches project rules (CLAUDE.md; the old AGENTS.md body), STATUS, DECISIONS, source.
+# Hook and command files carry the placeholder @SHIPMIRACLE_ENGINE@ for the engine folder; it is replaced by the real path when they are copied.
+# Backups of any replaced file (not agents) go to <project>/.claude/_backup/<timestamp>/. Idempotent.
+set -uo pipefail
+WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+dir="${1:-$PWD}"; cd "$dir" 2>/dev/null || { echo "no such folder: $dir" >&2; exit 2; }
+# same test as has_std in the sync tools: AGENTS.md, or a CLAUDE.md that carries the managed standard block (a plain CLAUDE.md, e.g. a cloned repo, is not ours)
+[[ -f AGENTS.md ]] || grep -q "SHIPMIRACLE-STANDARD BEGIN" CLAUDE.md 2>/dev/null || { echo "skip $dir: not a template-based project (no AGENTS.md, no SHIPMIRACLE-STANDARD block in CLAUDE.md)"; exit 0; }
+st=docs/STATUS.md; git ls-files --error-unmatch Docs/STATUS.md >/dev/null 2>&1 && st=Docs/STATUS.md   # a project may keep its records in Docs/ (macOS ignores case, git does not)
+[[ -f "$st" ]] || { echo "skip $dir: no docs/STATUS.md yet (not migrated onto the template); the Stop gate would block work here"; exit 0; }
+# STATUS must be tracked by git: an untracked copy means the migration is not merged yet
+[[ -d .git ]] && ! git ls-files --error-unmatch "$st" >/dev/null 2>&1 && { echo "skip $dir: docs/STATUS.md is not committed yet (migration branch not merged)"; exit 0; }
+ENGINE=$("$WS/bin/shipm" config get engine.dir 2>/dev/null); { [[ -n "$ENGINE" && "$ENGINE" != null ]] || ENGINE="$WS"; }
+rtmp=$(mktemp -d); trap 'rm -rf "$rtmp"' EXIT
+putr() { # src dst — like put, with @SHIPMIRACLE_ENGINE@ replaced by the engine folder (compared and copied in its rendered form)
+  [[ -f "$1" ]] || return 0
+  python3 -I -c 'import sys; sys.stdout.buffer.write(open(sys.argv[1], "rb").read().replace(b"@SHIPMIRACLE_ENGINE@", sys.argv[2].encode("utf-8")))' "$1" "$ENGINE" > "$rtmp/r" || return 0
+  put "$rtmp/r" "$2"
+}
+ts=$(date +%Y%m%d-%H%M%S); bk=".claude/_backup/$ts"; changed=0
+put() { # src dst — copy if different, backing up the old one
+  [[ -f "$1" ]] || return 0
+  if [[ -f "$2" ]] && cmp -s "$1" "$2"; then return 0; fi
+  if [[ -f "$2" ]]; then mkdir -p "$bk/$(dirname "$2")"; cp "$2" "$bk/$2"; fi
+  mkdir -p "$(dirname "$2")"; cp "$1" "$2"; changed=1; echo "  updated $2"
+}
+T="$WS/templates/base"
+for f in "$T"/.claude/hooks/*.sh; do putr "$f" ".claude/hooks/$(basename "$f")"; done
+for f in "$T"/.claude/commands/*.md; do putr "$f" ".claude/commands/$(basename "$f")"; done
+rm -f .claude/hooks/test-on-stop.sh
+# a project that already has its own git hook (no STATUS check in it, e.g. a project's own secret scanner) keeps it
+for f in "$T"/.githooks/*; do d=".githooks/$(basename "$f")"
+  [[ -e "$d" ]] && ! grep -q "STATUS.md" "$d" && { echo "  kept project's own $d"; continue; }
+  putr "$f" "$d"; done
+chmod +x .claude/hooks/*.sh .githooks/* 2>/dev/null
+# roles. Layout "userlevel": the team lives in ~/.claude/agents (shipm agents install), nothing is copied here.
+# Layout "legacy" (default): refresh the masters (new names) into the project without a backup, and delete old-name copies that are exact
+# copies of one of the last 5 committed versions of that old master (manifest legacy set); project-only and modified roles are kept.
+layout=$("$WS/bin/shipm" config get agents.layout 2>/dev/null || echo legacy)
+if [[ "$layout" != userlevel ]]; then
+  for f in "$WS"/agents/claude/*.md; do d=".claude/agents/$(basename "$f")"
+    cmp -s "$f" "$d" 2>/dev/null && continue
+    st=$(python3 -I - "$WS" "$(basename "$f" .md)" "$d" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+try:
+    from shipmiracle import agents
+    print(agents.copy_state(sys.argv[2], sys.argv[3]))
+except Exception:
+    print("modified")      # cannot tell: treat as the project's own work (backed up before it is replaced)
+PY
+)
+    case "$st" in
+      override) echo "  kept project's own $d (it carries overrides:)"; continue ;;
+      modified) mkdir -p "$bk/$(dirname "$d")"; cp "$d" "$bk/$d"; echo "  backed up the project's modified $d to $bk/$d" ;;
+    esac
+    mkdir -p .claude/agents; cp "$f" "$d"; changed=1; echo "  updated $d"
+  done
+  old=$(python3 -I - "$WS" "$PWD" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+try:
+    from shipmiracle import agents
+    print(" ".join(agents.remove_legacy_copies(sys.argv[2])))
+except Exception:
+    pass
+PY
+)
+  for n in $old; do changed=1; echo "  removed old-name agent copy .claude/agents/$n.md (exact copy of an old master; the new roles replace it)"; done
+fi
+mkdir -p docs/memory docs/plans
+[[ -f docs/memory/MEMORY.md ]] || put "$T/docs/memory/MEMORY.md" docs/memory/MEMORY.md
+[[ -f docs/plans/README.md ]] || put "$T/docs/plans/README.md" docs/plans/README.md
+if [[ ! -f docs/SKILLS.md ]]; then put "$T/docs/SKILLS.md" docs/SKILLS.md; sed "s/{{PROJECT_NAME}}/$(basename "$PWD")/" docs/SKILLS.md > docs/SKILLS.md.tmp && cat docs/SKILLS.md.tmp > docs/SKILLS.md; rm -f docs/SKILLS.md.tmp; fi   # portable: no sed -i (BSD needs '', GNU forbids it)
+[[ -d .git ]] && { git config core.hooksPath .githooks; }
+[[ -f .editorconfig ]] || put "$T/.editorconfig" .editorconfig
+out=$(python3 "$WS/bin/vscode-recs" "$PWD"); [[ -n "$out" ]] && { echo "$out"; changed=1; }
+
+# settings.json: merge template keys (model, autoMemoryDirectory, hooks) into the project's file, keep its other keys
+python3 - "$T/.claude/settings.json" .claude/settings.json "$bk" <<'PY'
+import json, pathlib, sys, shutil
+tpl, dst, bk = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3]
+t = json.load(open(tpl)); d = json.loads(dst.read_text()) if dst.exists() else {}
+new = dict(d); new["model"] = t["model"]; new["autoMemoryDirectory"] = d.get("autoMemoryDirectory") or t["autoMemoryDirectory"]; new["hooks"] = t["hooks"]
+if new != d:
+    if dst.exists():
+        b = pathlib.Path(bk)/dst; b.parent.mkdir(parents=True, exist_ok=True); shutil.copy(dst, b)
+    dst.parent.mkdir(parents=True, exist_ok=True); dst.write_text(json.dumps(new, indent=2)+"\n"); print("  updated .claude/settings.json")
+PY
+
+# migrate this project's Claude auto-memory from ~/.claude/projects/<path>/memory into docs/memory, once
+key=$(pwd -P | sed 's|/|-|g'); src="$HOME/.claude/projects/$key/memory"
+if [[ -d "$src" && ! -f docs/memory/.migrated ]]; then
+  n=0
+  for f in "$src"/*.md; do [[ -f "$f" ]] || continue; b=$(basename "$f")
+    if [[ "$b" == MEMORY.md ]]; then
+      # append index lines not already present
+      while IFS= read -r line; do [[ "$line" == -* ]] && ! grep -qF -- "$line" docs/memory/MEMORY.md && echo "$line" >> docs/memory/MEMORY.md; done < "$f"
+    else [[ -f "docs/memory/$b" ]] || { cp "$f" "docs/memory/$b"; n=$((n+1)); }; fi
+  done
+  date +%Y-%m-%d > docs/memory/.migrated; echo "  migrated $n memory files from ~/.claude into docs/memory"
+fi
+[[ $changed -eq 1 ]] && echo "  backups: $bk" || echo "  $(basename "$PWD"): already current"
+exit 0

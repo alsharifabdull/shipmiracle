@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Pre-commit (any tool): if source is staged, docs/STATUS.md must be staged too with
+# today's date in its "Updated:" line. Skip with: git commit --no-verify (say why in the message).
+staged=$(git diff --cached --name-only)
+[[ -n "$staged" ]] || exit 0
+# --- secret scan (gitleaks, brew install gitleaks); missing: warn, never block. A finding blocks the commit (override: --no-verify, say why).
+#--GITLEAKS-PRE-BEGIN--
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks protect --staged --redact --no-banner >&2; then
+    echo "commit blocked: gitleaks found a possible secret in the staged changes (see above). Remove it, or override with --no-verify (say why)." >&2; exit 1
+  fi
+else
+  echo "gitleaks not installed: secret scan skipped (brew install gitleaks)" >&2
+fi
+#--GITLEAKS-PRE-END--
+src=$(printf '%s\n' "$staged" | grep -vE '^docs/|^\.claude/|^\.agents/|^\.vscode/|^\.github/|^\.githooks/|\.md$|^\.gitignore$|^\.env\.example$|^\.editorconfig$|^\.githooks/')
+[[ -n "$src" ]] || exit 0
+today=$(date +%Y-%m-%d)
+if ! printf '%s\n' "$staged" | grep -qx 'docs/STATUS.md'; then
+  echo "commit blocked: source changed but docs/STATUS.md is not staged. Update it (Updated: $today, what changed, how verified, next, handoff) and git add it. Override: --no-verify." >&2; exit 1
+fi
+if ! git show :docs/STATUS.md 2>/dev/null | grep -qE "^Updated: *$today"; then
+  echo "commit blocked: docs/STATUS.md 'Updated:' line is not $today. Override: --no-verify." >&2; exit 1
+fi
+exit 0

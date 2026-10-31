@@ -1,0 +1,6 @@
+#!/bin/sh
+# fake external tool for the shipm init/uninstall tests: logs its argv to $SHIPMIRACLE_FAKE_LOG. `gitleaks version` answers like an installed tool. Shell builtins only.
+N=${0##*/}
+[ -n "$SHIPMIRACLE_FAKE_LOG" ] && printf "%s\n" "$N $*" >> "$SHIPMIRACLE_FAKE_LOG"
+case "$1" in --version|version) echo "0.1.0"; exit 0 ;; esac
+exit 0

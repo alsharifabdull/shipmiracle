@@ -1,0 +1,38 @@
+name: Bug report
+description: Something does not work as documented
+labels: ["bug"]
+body:
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: "e.g. 15.0"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: shipm version
+      description: The release you cloned (the top entry of CHANGELOG.md).
+    validations:
+      required: true
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `bin/shipm init --check --json`
+      description: "Before you paste: remove your name, account name, project names, network names and any path that contains them. Never paste tokens or secrets."
+      render: json
+    validations:
+      required: false

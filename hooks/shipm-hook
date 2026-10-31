@@ -1,0 +1,29 @@
+#!/usr/bin/python3
+import os, sys; sys.flags.isolated and sys.flags.no_site or os.execv(sys.executable, [sys.executable, "-I", "-S"] + sum(((["-X", k + "=" + v] if v is not True else ["-X", k]) for k, v in sys._xoptions.items()), []) + [os.path.realpath(__file__)] + sys.argv[1:]); sys.dont_write_bytecode = False; HD = os.path.dirname(os.path.realpath(__file__)); sys.path.append(os.path.dirname(HD))  # re-exec isolated when run directly (P4 L1); append: a workspace folder named like a stdlib module must not shadow it (P3 R4)
+T = {"UserPromptSubmit": "keep-awake guard-hook plan-approval flow-gate", "StopFailure": "limit-wait", "StatusLine": "plan-capture", "SubagentStart": "agent-state", "PreToolUse": "keep-awake guard-hook plan-approval:Edit|Write|NotebookEdit agent-cap:Agent|Task flow-gate:ExitPlanMode|Edit|Write|NotebookEdit|MultiEdit|Bash|Read|Grep|Glob|LS|NotebookRead", "PostToolUse": "plan-approval:ExitPlanMode flow-gate:Edit|Write|NotebookEdit|MultiEdit", "Stop": "keep-going flow-gate", "SubagentStop": "agent-state flow-gate"}
+def legacy(argv, why):  # LEGACY FALLBACK: the registered scripts, same stdin/env, parallel, merged by the spec 2.4 rules (deny/block joined, contexts joined); stdlib only
+    import contextlib, json, re, subprocess, time; from concurrent.futures import ThreadPoolExecutor; ev = ([a for a in argv if a[:2] != "--"] or [""])[0]; raw = sys.stdin.buffer.read(); errs = [why] if why else []; den = []; cx = []; sm = []; pl = []; tool = ""
+    try: tool = json.loads(raw).get("tool_name") or ""
+    except Exception: pass
+    jobs = [j[0] for j in (t.partition(":") for t in ("" if "--slow" in argv else T.get(ev, "")).split()) if not j[2] or re.fullmatch(j[2], tool)]
+    def run(s):
+        try: p = subprocess.run([os.path.join(HD, s + ".sh")], input=raw, capture_output=True, timeout=60, env=dict(os.environ, SHIPMIRACLE_HOOK_FALLBACK="1")); json.loads(p.stdout or b"{}") if (ev == "PreToolUse" and s == "flow-gate" and p.returncode == 0) else 0; assert p.returncode in (0, 2) or s != "flow-gate" or ev != "PreToolUse", p.returncode; return p.returncode, p.stdout, p.stderr   # flow-gate on PreToolUse: a crash code or garbage output is a failure (refused)
+        except Exception as x: errs.append("%s failed: %r" % (s, x)); return (2, b"", b"The project-isolation and team-flow check did not answer; the call is refused until it does.") if (ev == "PreToolUse" and s == "flow-gate") else (0, b"", b"")
+    rs = list(ThreadPoolExecutor(8).map(run, jobs)); live = [r for r in rs if r[1].strip() or r[0] == 2]
+    for rc, o, e in rs:
+        t = o.decode("utf-8", "replace")
+        try: d = json.loads(t); h = d.get("hookSpecificOutput") or {}
+        except Exception: d = h = {}; pl += [t] if t.strip() else []
+        den += [e.decode("utf-8", "replace").rstrip("\n")] if rc == 2 else [h.get("permissionDecisionReason") or d.get("reason") or ""] if h.get("permissionDecision") == "deny" or d.get("decision") == "block" else []
+        cx += [h["additionalContext"]] if h.get("additionalContext") else []; sm += [d["systemMessage"]] if d.get("systemMessage") else []
+    with contextlib.suppress(Exception): sd = os.environ.get("SHIPMIRACLE_STATE") or os.path.join(os.path.expanduser("~"), ".local/state/shipmiracle"); errs and os.makedirs(sd, exist_ok=True); errs and open(os.path.join(sd, "flow-errors.log"), "a").write(time.strftime("%F %T ") + "module=shipmiracle-hook-fallback %s: %s\n" % (ev, "; ".join(errs)))   # a log failure must not drop the legacy decision (P4 M1)
+    r = "\n".join(den) or "blocked"; c = " ".join(cx + pl).strip()
+    obj = {"hookSpecificOutput": {"hookEventName": ev, "permissionDecision": "deny", "permissionDecisionReason": r}} if den and ev == "PreToolUse" else {"decision": "block", "reason": r} if den and ev in ("Stop", "SubagentStop") else None
+    if den and obj is None: sys.stderr.write(r + "\n"); return 2
+    if obj is None and len(live) > 1: obj = {"hookSpecificOutput": {"hookEventName": ev, "additionalContext": c}} if c and ev in ("UserPromptSubmit", "PostToolUse", "SessionStart", "SubagentStart") else {"systemMessage": " ".join(sm + ([c] if c else []))}
+    sys.stdout.buffer.write((json.dumps(obj) + "\n").encode() if obj else live[0][1] if len(live) == 1 else b"")
+try: from shipmiracle.hooks.core import main
+except BaseException as e: main = lambda a, e=e: "legacy:core import failed: " + repr(e)[:200]   # SystemExit at import time too
+try: rc = main(sys.argv[1:]); rc = legacy(sys.argv[1:], rc[7:]) if isinstance(rc, str) else rc
+except BaseException: rc = 2 if sys.argv[1:2] == ["PreToolUse"] and not sys.stderr.write("The project-isolation and team-flow check did not answer; the call is refused until it does.\n") else 0   # G11: PreToolUse fails closed
+sys.exit(rc or 0)

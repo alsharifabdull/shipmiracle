@@ -1,0 +1,51 @@
+# Runs the project's test command on every pull request and push to main.
+# Free GitHub-hosted Linux runners; iOS projects have no CI (tested locally).
+# Skips quietly until the project has something to test (a package.json, pyproject or pytest setup).
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**']     # notes and handoff files do not need a full test run
+permissions:
+  contents: read                              # least privilege: tests only need to read the repo
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true                    # a newer push replaces a run that is still going
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }      # the token is not left in .git/config for later steps
+      - name: Detect test setup
+        id: detect
+        run: |
+          if [ -f package.json ] && grep -q '"test"' package.json; then echo "kind=node" >> "$GITHUB_OUTPUT";
+          elif [ -f pyproject.toml ] || [ -f requirements.txt ] || ls tests/*.py test_*.py >/dev/null 2>&1; then echo "kind=python" >> "$GITHUB_OUTPUT";
+          else echo "kind=none" >> "$GITHUB_OUTPUT"; echo "No tests yet; nothing to run."; fi
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.kind == 'node' && hashFiles('.nvmrc') != ''
+        with: { node-version-file: .nvmrc }       # the project's own Node, not whatever "lts" is today
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.kind == 'node' && hashFiles('.nvmrc') == ''
+        with: { node-version: lts/* }             # no .nvmrc: fall back to the current LTS
+      - name: Node tests
+        if: steps.detect.outputs.kind == 'node'
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          # Build before testing: tests may import a built workspace package. A project with TypeScript project
+          # references gets `tsc -b`; any other project runs its own build script if it has one (no build script = no-op).
+          if [ -f tsconfig.json ] && grep -q '"references"' tsconfig.json; then npx --no-install tsc -b || { echo "::error::tsc not found: add typescript to devDependencies (npx must not download it)"; exit 1; }; else npm run build --if-present; fi
+          npm test
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.kind == 'python'
+        with: { python-version: "3.12" }
+      - name: Python tests
+        if: steps.detect.outputs.kind == 'python'
+        run: |
+          # pytest is deliberately unpinned (a project that needs a version pins it in requirements.txt / pyproject)
+          python -m pip install -q -U pip pytest
+          [ -f requirements.txt ] && pip install -q -r requirements.txt || true
+          [ -f pyproject.toml ] && pip install -q -e . || true
+          python -m pytest -q

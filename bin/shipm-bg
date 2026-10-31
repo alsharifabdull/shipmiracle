@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""shipm-bg MINUTES -- COMMAND [ARGS...] — run a long job with a deadline (macOS has no `timeout`).
+Starts COMMAND in its own process group, logs start/end to ~/.local/state/shipmiracle/bg.log, and ends the whole group
+(TERM, then KILL after 10 s) when MINUTES pass. Exit code is the command's, or 124 on timeout. Default deadline 120."""
+import os, signal, subprocess, sys, time
+a = sys.argv[1:]
+if "--" not in a or a.index("--") > 1 or len(a) < 3:
+    sys.exit("usage: shipm-bg MINUTES -- COMMAND [ARGS...]")
+i = a.index("--"); mins = float(a[0]) if i == 1 else 120.0; cmd = a[i + 1:]
+log = os.path.expanduser(os.environ.get("SHIPMIRACLE_BG_LOG", "~/.local/state/shipmiracle/bg.log")); os.makedirs(os.path.dirname(log), exist_ok=True)
+def note(s):
+    try: open(log, "a").write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} pid={os.getpid()} {s}\n")
+    except OSError: pass
+p = subprocess.Popen(cmd, start_new_session=True)
+note(f"start deadline={mins:g}min cwd={os.getcwd()} cmd={' '.join(cmd)[:200]}")
+def stop(sig):
+    try: os.killpg(p.pid, sig)
+    except ProcessLookupError: pass
+for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(s, lambda n, f: (stop(signal.SIGTERM), note(f"signal {n}")))
+end = time.time() + mins * 60; timed_out = False
+while p.poll() is None:
+    if time.time() >= end and not timed_out:
+        timed_out = True; note("deadline reached: ending the job"); stop(signal.SIGTERM); end = time.time() + 10
+    elif timed_out and time.time() >= end:
+        stop(signal.SIGKILL); break
+    time.sleep(0.2)
+rc = 124 if timed_out else p.wait() if p.poll() is None else p.returncode
+stop(signal.SIGKILL) if timed_out else None
+note(f"end rc={rc}")
+sys.exit(rc)

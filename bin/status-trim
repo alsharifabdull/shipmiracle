@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""status-trim [PROJECT-DIR] [--cap BYTES] [--keep N] [--dry] [--force]
+Keep docs/STATUS.md short. Kept always: the header (title, first Updated: line, intro) and the sections
+In progress / Next / Not verified / Last verification / Handoff / Archived index. Of the other `## ` chapters
+the N most recent dated ones (default 5, env SHIPMIRACLE_STATUS_KEEP) stay while the whole file fits the byte cap
+(default 20000, env SHIPMIRACLE_STATUS_CAP); undated ones stay only if they still fit after that. Every other chapter moves,
+text UNCHANGED, to docs/status-archive/<YYYY-MM>-<slug>.md (appended, heading kept) and a one-line
+`Archived: <heading> -> <file>` entry is added to the `## Archived index` section, so nothing is lost silently.
+Idempotent, atomic (temp file + rename, original file mode kept). Refuses (unless --force): a non-git folder, uncommitted STATUS.md changes. Always refuses symlinked
+STATUS.md / docs / status-archive (exit 2). Aborts with exit 3 if STATUS.md changed between read and write.
+--dry prints what would move and changes nothing. Kept text is never reordered or altered."""
+import datetime as dt, hashlib, os, re, subprocess, sys, tempfile
+
+MON = {m: i + 1 for i, m in enumerate("jan feb mar apr may jun jul aug sep oct nov dec".split())}
+PROT = re.compile(r"^(in progress|next|not verified|last verification|handoff|archived index)", re.I)
+INDEX = "## Archived index"
+
+
+def today():
+    return dt.date.fromisoformat(os.environ["SHIPMIRACLE_TODAY"]) if os.environ.get("SHIPMIRACLE_TODAY") else dt.date.today()
+
+
+def when(title, now):
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", title)
+    try:
+        if m:
+            return dt.date(int(m[1]), int(m[2]), int(m[3]))
+        m = re.search(r"\b(\d{1,2}) (jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*(?: (\d{4}))?", title, re.I)
+        if m:
+            d = dt.date(int(m[3] or now.year), MON[m[2].lower()], int(m[1]))
+            if not m[3] and (d - now).days > 31:
+                d = d.replace(year=d.year - 1)
+            return d
+    except ValueError:
+        return None
+    return None
+
+
+def split(text):
+    """(header, [chapter,...]); a chapter starts at a '## ' line outside code fences. ''.join == text."""
+    lines = text.splitlines(keepends=True)
+    cuts, fence = [], False
+    for i, l in enumerate(lines):
+        if l.lstrip().startswith(("```", "~~~")):
+            fence = not fence
+        elif not fence and l.startswith("## "):
+            cuts.append(i)
+    if not cuts:
+        return text, []
+    b = cuts + [len(lines)]
+    return "".join(lines[:cuts[0]]), ["".join(lines[b[k]:b[k + 1]]) for k in range(len(cuts))]
+
+
+def title_of(ch):
+    return ch.split("\n", 1)[0][3:].strip()
+
+
+def slug(t):
+    s = re.sub(r"[^a-z0-9]+", "-", t.lower()).strip("-")[:50].strip("-")
+    return s or "chapter"
+
+
+def nb(s):
+    return len(s.encode("utf-8"))
+
+
+def plan(text, cap, keepn, now, reserve=0):
+    """returns (kept_flags, header, chapters); pure. `reserve` bytes are left free for index lines."""
+    head, chs = split(text)
+    cap -= reserve
+    keep = [False] * len(chs)
+    used = nb(head)
+    cand = []
+    for i, c in enumerate(chs):
+        if PROT.match(title_of(c)):
+            keep[i] = True
+            used += nb(c)
+        else:
+            cand.append((i, when(title_of(c), now)))
+    dated = sorted([(i, w) for i, w in cand if w], key=lambda x: (-x[1].toordinal(), x[0]))
+    n = 0
+    for i, w in dated:
+        if n >= keepn or used + nb(chs[i]) > cap:
+            break
+        keep[i] = True; used += nb(chs[i]); n += 1
+    for i, w in cand:
+        if not w and used + nb(chs[i]) <= cap:
+            keep[i] = True; used += nb(chs[i])
+    return keep, head, chs
+
+
+def atomic(path, data):
+    """temp file in the same folder, original mode kept (new files: 0666 & ~umask), then rename."""
+    try:
+        mode = os.stat(path).st_mode & 0o7777
+    except OSError:
+        um = os.umask(0); os.umask(um); mode = 0o666 & ~um
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fh.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp): os.unlink(tmp)
+        raise
+
+
+def sha(path):
+    with open(path, "rb") as fh: return hashlib.sha256(fh.read()).hexdigest()
+
+
+def unsafe(d, p, ad):
+    """reason string if STATUS.md / docs / status-archive is a symlink or escapes the project dir, else ''."""
+    root = os.path.realpath(d)
+    for x in (os.path.join(d, "docs"), p, ad):
+        if os.path.islink(x): return f"{x} is a symlink"
+        rp = os.path.realpath(x)
+        if rp != root and not rp.startswith(root + os.sep): return f"{x} resolves outside the project folder"
+    return ""
+
+
+def is_git(d):
+    try:
+        r = subprocess.run(["git", "-C", d, "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def dirty(d):
+    try:
+        r = subprocess.run(["git", "-C", d, "status", "--porcelain", "--", "docs/STATUS.md"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def with_index(kept_text, entries):
+    """add index entries (list of lines) to the Archived index section, creating it at the end."""
+    head, chs = split(kept_text)
+    add = "".join(e + "\n" for e in entries)
+    for i, c in enumerate(chs):
+        if title_of(c).lower().startswith("archived index"):
+            body = c.rstrip("\n")
+            chs[i] = body + "\n" + add + c[len(body) + 1:]
+            return head + "".join(chs)
+    base = kept_text if kept_text.endswith("\n") or not kept_text else kept_text + "\n"
+    return base + ("\n" if base else "") + INDEX + "\n" + add
+
+
+def main(argv):
+    a = list(argv)
+    def opt(name, env, default):
+        if name in a:
+            i = a.index(name); v = a[i + 1]; del a[i:i + 2]; return int(v)
+        return int(os.environ.get(env) or default)
+    try:
+        cap = opt("--cap", "SHIPMIRACLE_STATUS_CAP", 20000); keepn = opt("--keep", "SHIPMIRACLE_STATUS_KEEP", 5)
+    except (IndexError, ValueError):
+        print("status-trim: --cap/--keep need a whole number", file=sys.stderr); return 2
+    dry = "--dry" in a; force = "--force" in a
+    pos = [x for x in a if not x.startswith("--")]
+    d = pos[0] if pos else "."
+    p = os.path.join(d, "docs", "STATUS.md")
+    ad = os.path.join(d, "docs", "status-archive")
+    why = unsafe(d, p, ad)
+    if why:
+        print(f"status-trim: refusing: {why}", file=sys.stderr); return 2
+    try:
+        with open(p, "rb") as fh: raw = fh.read()
+        text = raw.decode("utf-8"); digest = hashlib.sha256(raw).hexdigest()
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"status-trim: cannot read {p}: {e}", file=sys.stderr); return 2
+    if not dry and not force and not is_git(d):
+        print("status-trim: not a git repository, so uncommitted edits cannot be checked; use --force", file=sys.stderr); return 2
+    if not dry and not force and dirty(d):
+        print("status-trim: docs/STATUS.md has uncommitted changes; commit first or use --force", file=sys.stderr); return 3
+    now = today()
+    keep, head, chs = plan(text, cap, keepn, now)
+    for _ in range(6):   # each moved chapter adds one index line (~140 B): leave room for them
+        res = 140 * sum(1 for k in keep if not k)
+        k2, head, chs = plan(text, cap, keepn, now, res)
+        if k2 == keep: break
+        keep = k2
+    moved = [c for c, k in zip(chs, keep) if not k]
+    kb = lambda n: "%.1f KB" % (n / 1024)
+    if not moved:
+        print(f"nothing to move: STATUS.md {kb(nb(text))}, cap {kb(cap)}")
+        if nb(text) > cap: print("warning: over the cap but only protected sections remain; shorten them by hand")
+        return 0
+    target = []
+    for c in moved:
+        t = title_of(c); w = when(t, now) or now
+        target.append(f"{w.strftime('%Y-%m')}-{slug(t)}.md")
+    kept_text = head + "".join(c for c, k in zip(chs, keep) if k)
+    entries = [f"Archived: {title_of(c)} -> docs/status-archive/{f}" for c, f in zip(moved, target)]
+    have = kept_text
+    entries = [e for e in entries if e + "\n" not in have]
+    new = with_index(kept_text, entries)
+    for c, f in zip(moved, target):
+        print(f"  move ({kb(nb(c))}): {title_of(c)[:80]} -> docs/status-archive/{f}")
+    print(f"{len(moved)} chapter(s) move; STATUS.md {kb(nb(text))} -> {kb(nb(new))}" + (" (dry run, nothing written)" if dry else ""))
+    if dry: return 0
+    os.makedirs(ad, exist_ok=True)
+    if unsafe(d, p, ad):
+        print("status-trim: refusing: " + unsafe(d, p, ad), file=sys.stderr); return 2
+    for c, f in zip(moved, target):
+        fp = os.path.join(ad, f)
+        if os.path.islink(fp):
+            print(f"status-trim: refusing: {fp} is a symlink", file=sys.stderr); return 2
+        old = ""
+        if os.path.exists(fp):
+            with open(fp, encoding="utf-8", newline="") as fh: old = fh.read()
+        if c.rstrip("\n") in old: continue   # already archived (an earlier run stopped before STATUS was written)
+        if not old:
+            old = f"# STATUS archive: {title_of(c)}\n\nMoved out of docs/STATUS.md by bin/status-trim; text unchanged.\n\n"
+        atomic(fp, old.rstrip("\n") + "\n\n" + c.rstrip("\n") + "\n")
+    if os.environ.get("SHIPMIRACLE_TEST") == "1" and os.environ.get("SHIPMIRACLE_TRIM_TEST_MUTATE"):   # test hook: simulate a writer
+        with open(p, "a", encoding="utf-8") as fh: fh.write(os.environ["SHIPMIRACLE_TRIM_TEST_MUTATE"])
+    if os.path.islink(p) or sha(p) != digest:
+        print("status-trim: docs/STATUS.md changed while trimming; nothing written to it (archive copies are harmless); run again", file=sys.stderr); return 3
+    atomic(p, new)   # archive first, STATUS last: a crash in between loses nothing
+    if nb(new) > cap: print("warning: still over the cap; protected sections are large")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,1640 @@
+#!/usr/bin/env python3
+"""shipm-watch — finds frozen or stuck work (chats, agents, background jobs, leftovers) in every project and keeps the Mac healthy.
+
+  shipm-watch scan [--dry]           one scan: writes ~/.local/state/shipmiracle/health.json (+ lineage.json), cleans what is provably safe (not with --dry)
+  shipm-watch status                 human-readable summary of health.json
+  shipm-watch host [--heavy-ok]      exit 0 if the Mac can take a heavy job (swap < 70 %, load < 1.5 x cores), else 1 and the reason
+  shipm-watch can OP ID              {ok, why, project, kind, working}: is this step applicable right now (fresh raw scan, item still raised)?
+  shipm-watch act OP ID              an action the owner clicked: {"ok":bool,"did":str,"why":str} (checked against a fresh scan and the live process first)
+  shipm-watch act checkpoint PROJECT save uncommitted work to wip/frozen-<date> (git plumbing; the working tree is not touched); prints the branch
+  shipm-watch verify ID              one scan without hysteresis: {gone, detail, checked, item, chat_state, working, interrupted_at, lead_mtime}
+  shipm-watch contract               the registry (KINDS / OPS) as JSON
+
+Every item kind is declared ONCE in KINDS below (mode auto | fix | info | wait, an ordered chain of OPS, texts); add() fills the item from it.
+tests/health_contract_test.py fails the build for a kind without an entry. Quiet = no write in the chat's transcript or its agents' files.
+Frozen = quiet AND no child process using CPU. A chat that waits for you, for a plan approval, for the usage limit, for the API or for a
+background job is shown as that, never as frozen. Items appear after 2 scans in a row and disappear after 2 clean scans (info/auto at once).
+Automatic: provably dead agent records and 'working' states (every scan), proven orphans, old task outputs, state files of projects that do not
+exist. Never automatic: ending a live chat, agent or job. Scans, verify and act share one lock (STATE/watch.lock).
+Env for tests (they count only when SHIPMIRACLE_TEST=1): SHIPMIRACLE_STATE SHIPMIRACLE_HOME SHIPMIRACLE_DEV SHIPMIRACLE_WS SHIPMIRACLE_NOW SHIPMIRACLE_PS (ps table file) SHIPMIRACLE_LSOF (json pid->cwd) SHIPMIRACLE_HOST (json host readings) SHIPMIRACLE_KILL_LOG
+(record kills instead of killing) SHIPMIRACLE_TMP (task output root) SHIPMIRACLE_LOCK_WAIT (seconds to wait for the scan lock) SHIPMIRACLE_DOCKER (file: one 'name<TAB>compose working_dir' line per container; first line
+ERROR = docker cannot be asked) SHIPMIRACLE_COLIMA (file: 'running' or 'stopped'; `colima stop` writes 'stopped' into it)."""
+import datetime, fcntl, hashlib, json, os, pathlib, re, signal, subprocess, sys, time
+
+# The Shipmiracle package is optional: a broken or missing package must never stop the watcher (old inline behaviour is the fallback).
+try:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    from shipmiracle import projects as shipmiracle_projects, state as shipmiracle_state
+except BaseException as _e:
+    if isinstance(_e, KeyboardInterrupt):
+        raise
+    shipmiracle_projects = shipmiracle_state = None
+try:                                                       # F7: set aside (optional on its own)
+    from shipmiracle import aside as shipmiracle_aside
+except BaseException as _e:
+    if isinstance(_e, KeyboardInterrupt):
+        raise
+    shipmiracle_aside = None
+try:                                                       # P5c: change-request and autopilot Health kinds; each optional on its own
+    from shipmiracle.playbook import store as shipmiracle_cr
+except BaseException as _e:
+    if isinstance(_e, KeyboardInterrupt):
+        raise
+    shipmiracle_cr = None
+try:
+    from shipmiracle.autopilot import state as shipmiracle_ap
+except BaseException as _e:
+    if isinstance(_e, KeyboardInterrupt):
+        raise
+    shipmiracle_ap = None
+
+def env(name, default=None):
+    """SHIPMIRACLE_* overrides exist for tests only: they count when SHIPMIRACLE_TEST=1 (like bin/shipm-chat), so a stray variable can never redirect the watcher."""
+    return os.environ.get(name, default) if os.environ.get("SHIPMIRACLE_TEST") == "1" else default
+
+
+HOME = pathlib.Path(env("SHIPMIRACLE_HOME", pathlib.Path.home()))
+WS = pathlib.Path(env("SHIPMIRACLE_WS", pathlib.Path(__file__).resolve().parent.parent))
+STATE = pathlib.Path(env("SHIPMIRACLE_STATE", HOME / ".local/state/shipmiracle"))
+DEV = pathlib.Path(env("SHIPMIRACLE_DEV", HOME / "Developer"))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+try:
+    from shipmiracle import platform as aplat      # OS differences (macOS commands unchanged, Linux reads /proc); without it the macOS code below runs as before
+except Exception:
+    aplat = None
+TMP = pathlib.Path(env("SHIPMIRACLE_TMP", aplat.claude_tmp_dir() if aplat else f"/private/tmp/claude-{os.getuid()}"))
+GIT = "/usr/bin/git"; LSOF = "/usr/sbin/lsof"
+DEFAULTS = {"frozen_min": 20, "agent_frozen_min": 20, "job_silent_min": 30, "job_age_h": 2, "idle_session_h": 24, "host_swap_pct": 80, "host_swap_clear": 70,
+            "host_free_pct": 20, "host_free_clear": 30, "host_load_x": 2.0, "host_load_clear": 1.5, "host_scans": 5, "hog_gb": 4, "hog_cpu": 300, "hog_scans": 10,
+            "vm_hours": 24, "orphan_min": 30, "orphan_cpu": 2, "stale_agent_h": 3, "stale_quiet_min": 20, "output_days": 7, "hold_release_min": 30, "session_large_mb": 80,
+            "api_errors": 3, "compactions": 3, "stray_browser_min": 30, "stray_testrun_min": 20, "auto": True, "auto_dead_agents": True, "housekeeping_every_min": 60, "busy_cpu": 2.0}
+SAFE = {   # what could be lost by each button, said plainly (the checkpoint skips secret files and files over 5 MB, it never changes them)
+    "interrupt": "Nothing is lost; the chat stays open and you can carry on.",
+    "relaunch": "Your files and the conversation are kept (files saved to a wip branch first, conversation stays on disk). Only a tool call running at this very moment is cut off.",
+    "fresh": "Nothing is deleted (files saved to a wip branch, the old conversation stays on disk, /resume brings it back). The new chat starts from STATUS and memory, so details that were only in the long chat are not in its head.",
+    "end-job": "Files are saved to a wip branch first. Only the job's own unfinished output is lost.",
+    "end-proc": "It belongs to no chat. Only its unsaved in-memory state is lost.",
+    "quit-session": "Files saved to a wip branch first; the conversation stays on disk and reopens from the Projects button.",
+    "close-duplicate": "Files saved to a wip branch first; the VS Code copy of the same conversation keeps going.",
+    "stop-colima": "No container is running, so no data is lost; images and volumes stay and start again with the VM.",
+    "pause-agents": "Nothing is lost; press Resume any time.",
+    "drop-record": "Only the watcher's bookkeeping changes; no process is touched.",
+    "end-browser": "Only automation browsers whose profile folder is in a temp folder are ended; a browser with any other profile is never touched.",
+    "end-testrun": "Only that test-all run gets SIGTERM (it cleans its own children). Nothing else is touched.",
+}
+INFRA = re.compile(r"playwright|mcp-server|@modelcontextprotocol|caffeinate|shell-snapshots|^ps |^lsof |ugrep|shipm-watch|shipm-guard")
+ALLOW = re.compile(r"playwright-mcp|@playwright/mcp|mcp-server|^sleep \d{3,}|bash -c .*while true")
+VM_RE = re.compile(r"Virtualization\.framework.*VirtualMachine|com\.apple\.Virtualization\.Virtu")
+HOSTAGENT_RE = re.compile(r"limactl hostagent")
+BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")   # launchd (the guard) has no Homebrew in PATH: tools are called by absolute path
+INTERRUPT_RE = re.compile(r"Request interrupted by user")
+
+
+def is_interrupt(line):
+    """Only a user record whose message text STARTS with '[Request interrupted by user' counts. The string quoted in a tool result, an assistant text or a file
+    that was read does not."""
+    if not INTERRUPT_RE.search(line):
+        return False
+    try:
+        r = json.loads(line)
+        if not isinstance(r, dict) or r.get("type") != "user":
+            return False
+        c = (r.get("message") or {}).get("content")
+        texts = [c] if isinstance(c, str) else [b.get("text", "") for b in (c or []) if isinstance(b, dict) and b.get("type") == "text"]
+        return any(isinstance(t, str) and t.startswith("[Request interrupted by user") for t in texts)
+    except Exception:
+        return False
+
+
+def now():
+    return float(env("SHIPMIRACLE_NOW") or time.time())
+
+
+def jread(p, d=None):
+    try:
+        return json.loads(pathlib.Path(p).read_text())
+    except Exception:
+        return d
+
+
+def jwrite(p, obj, mode=None):
+    p = pathlib.Path(p); p.parent.mkdir(parents=True, exist_ok=True)
+    t = p.with_name("." + p.name + ".tmp")
+    if mode is None:
+        t.write_text(json.dumps(obj))
+    else:
+        fd = os.open(str(t), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(obj))
+        os.chmod(str(t), mode)
+    t.replace(p)
+
+
+SECRET_RE = re.compile(r"(?i)(token|key|secret|password|authorization|bearer|passwd)([=: ]+)(?:(?:bearer|basic)\s+)?\S+")
+B64_RE = re.compile(r"[A-Za-z0-9+/_-]{40,}={0,2}")
+
+
+def red(text):
+    """A command line as it may be stored or shown: secrets and long base64-looking runs removed."""
+    return B64_RE.sub("<redacted>", SECRET_RE.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", str(text)))
+
+
+def cfg():
+    c = dict(DEFAULTS); u = jread(WS / "config/watch.json", {})
+    c.update(u if isinstance(u, dict) else {}); return c
+
+
+def sh(cmd, timeout=10, env=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env); return r.returncode, (r.stdout + r.stderr)
+    except Exception as e:
+        return 1, repr(e)
+
+
+def log(msg):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "events.log", "a") as f:
+        f.write(f"{time.strftime('%F %T', time.localtime(now()))} watch: {msg}\n")
+
+
+def tool(name):
+    """Absolute path of a tool (docker, colima) or '' — never from PATH."""
+    for d in BIN_DIRS:
+        p = os.path.join(d, name)
+        if os.access(p, os.X_OK):
+            return p
+    return ""
+
+
+def tool_env():
+    return dict(os.environ, PATH=os.environ.get("PATH", "") + ":" + ":".join(BIN_DIRS))
+
+
+def hhmm(ts):
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+# ---------- readings ----------
+def etime_s(s):
+    d = 0
+    if "-" in s:
+        a, s = s.split("-", 1); d = int(a)
+    p = [int(x) for x in s.split(":")]
+    while len(p) < 3:
+        p.insert(0, 0)
+    return d * 86400 + p[0] * 3600 + p[1] * 60 + p[2]
+
+
+def read_ps():
+    f = env("SHIPMIRACLE_PS")
+    out = pathlib.Path(f).read_text() if f else sh(["/bin/ps", "-axo", "pid=,ppid=,etime=,pcpu=,rss=,command="], 15)[1]
+    procs, t = {}, now()
+    for line in out.splitlines():
+        m = re.match(r"^\s*(\d+)\s+(\d+)\s+(\S+)\s+([\d.]+)\s+(\d+)\s+(.*)$", line)
+        if m:
+            pid = int(m.group(1)); age = etime_s(m.group(3))
+            procs[pid] = {"pid": pid, "ppid": int(m.group(2)), "age": age, "start": t - age, "cpu": float(m.group(4)), "rss": int(m.group(5)) / 1024.0, "cmd": m.group(6)}
+    return procs
+
+
+def cwd_of(pid):
+    f = env("SHIPMIRACLE_LSOF")
+    if f:
+        return (jread(f, {}) or {}).get(str(pid), "")
+    if aplat:
+        return aplat.pid_cwd(pid)
+    rc, out = sh([LSOF, "-a", "-p", str(pid), "-d", "cwd", "-Fn"], 4)
+    m = re.search(r"\nn(.+)", out)
+    return m.group(1) if m else ""
+
+
+def host_readings():
+    f = env("SHIPMIRACLE_HOST")
+    if f:
+        return jread(f, {})
+    if aplat:
+        r = aplat.host_load()      # a value nobody could read is listed in "unknown" (neutral numbers here, so the monitor raises no false alarm; `host` says unknown)
+        h = {"swap_pct": 0, "free_pct": 100, "load": 0.0, "cores": 1, "vm_gb": 0, "unknown": list(r["unknown"])}
+        for k in ("swap_pct", "free_pct", "load", "cores"):
+            if r[k] is not None:
+                h[k] = r[k]
+        return h
+    h = {"swap_pct": 0, "free_pct": 100, "load": 0.0, "cores": 1, "vm_gb": 0}
+    rc, o = sh(["/usr/sbin/sysctl", "-n", "vm.swapusage"]); m = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M", o)
+    if m and float(m.group(1)) > 0:
+        h["swap_pct"] = round(100 * float(m.group(2)) / float(m.group(1)), 1)
+    rc, o = sh(["/usr/sbin/sysctl", "-n", "vm.loadavg"]); m = re.search(r"([\d.]+)", o); h["load"] = float(m.group(1)) if m else 0.0
+    rc, o = sh(["/usr/sbin/sysctl", "-n", "hw.ncpu"]); h["cores"] = int(o.strip() or 1) if o.strip().isdigit() else 1
+    rc, o = sh(["/usr/sbin/sysctl", "-n", "hw.memsize"]); mem = int(o.strip()) if o.strip().isdigit() else 0
+    rc, o = sh(["/usr/bin/vm_stat"])
+    pg = re.search(r"page size of (\d+)", o); free = sum(int(x) for x in re.findall(r"Pages (?:free|inactive|speculative):\s+(\d+)", o))
+    if mem and pg:
+        h["free_pct"] = round(100 * free * int(pg.group(1)) / mem, 1)
+    return h
+
+
+def docker_ask():
+    """(ok, rows): rows = [(container name, compose working_dir)]. ok False = Docker cannot be asked (not installed, VM stopped, timeout)."""
+    f = env("SHIPMIRACLE_DOCKER")
+    if f:
+        try:
+            lines = pathlib.Path(f).read_text().splitlines()
+        except OSError:
+            return False, []
+        if lines and lines[0].strip() == "ERROR":
+            return False, []
+        return True, [tuple((ln.split("\t") + [""])[:2]) for ln in lines if ln.strip()]
+    d = tool("docker")
+    if not d:
+        return False, []
+    rc, out = sh([d, "--context", "colima", "ps", "--format", '{{.Names}}\t{{.Label "com.docker.compose.project.working_dir"}}'], 4, tool_env())
+    if rc != 0:
+        return False, []
+    return True, [tuple((ln.split("\t") + [""])[:2]) for ln in out.splitlines() if ln.strip()]
+
+
+def colima_running():
+    f = env("SHIPMIRACLE_COLIMA")
+    if f:
+        try:
+            return "running" in pathlib.Path(f).read_text()
+        except OSError:
+            return False
+    c = tool("colima")
+    return bool(c) and sh([c, "status"], 8, tool_env())[0] == 0
+
+
+def projects():
+    if shipmiracle_projects:
+        try:
+            return shipmiracle_projects.names(dev=DEV)
+        except Exception:
+            pass
+    try:
+        return sorted(p.name for p in DEV.iterdir() if (p / ".git").exists())
+    except Exception:
+        return []
+
+
+def proj_dirs(name):
+    root = HOME / ".claude/projects"
+    try:
+        own = {re.sub(r"[^A-Za-z0-9]", "-", str(base / name)) for base in (DEV, DEV.resolve())}      # the project's own folder under the projects folder always counts, even when that folder sits under a path with a 'tmp' part (a test sandbox)
+        return [d for d in root.iterdir() if d.is_dir() and (d.name in own or (d.name.endswith("-" + name.replace(".", "-")) and "-tmp-" not in d.name))]
+    except Exception:
+        return []
+
+
+def transcripts(name):
+    """Newest session of the project: path, size, newest write (lead + sub-agents), and the agents' files."""
+    best = None
+    for d in proj_dirs(name):
+        for f in d.glob("*.jsonl"):
+            m = f.stat().st_mtime
+            if not best or m > best[0]:
+                best = (m, f)
+    if not best:
+        return None
+    m, f = best; agents = {}
+    sub = f.with_suffix("") / "subagents"
+    if sub.exists():
+        for g in sub.glob("agent-*.jsonl"):
+            agents[g.stem[len("agent-"):]] = g.stat().st_mtime
+    newest = max([m] + list(agents.values()))
+    return {"path": str(f), "sid": f.stem, "size_mb": round(f.stat().st_size / 1048576, 1), "lead": m, "newest": newest, "agents": agents}
+
+
+_tail_cache = {}
+
+
+API_RE = re.compile(r'"subtype":\s*"api_error"')
+
+
+def tail_signals(path, mtime, t):
+    """API errors (10 min), compactions (2 h), 'Prompt is too long' (30 min) and the newest 'Request interrupted by user' marker (any age) from the last
+    300 KB of a transcript. Cached per file version."""
+    key = (path, mtime)
+    if key not in _tail_cache:
+        ev = []
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2); size = fh.tell(); fh.seek(max(0, size - 300_000)); data = fh.read().decode("utf-8", "ignore")
+            for line in data.splitlines()[1 if size > 300_000 else 0:]:
+                kind = ("interrupt" if is_interrupt(line) else "api" if API_RE.search(line) else "long" if "Prompt is too long" in line
+                        else "compact" if ("compact_boundary" in line or '"isCompactSummary":true' in line) else "")
+                if not kind:
+                    continue
+                m = re.search(r'"timestamp":\s*"([^"]+)"', line)
+                try:
+                    ts = datetime.datetime.fromisoformat(m.group(1).replace("Z", "+00:00")).timestamp() if m else mtime
+                except Exception:
+                    ts = mtime
+                ev.append((kind, ts))
+        except Exception:
+            pass
+        _tail_cache.clear(); _tail_cache[key] = ev
+    ev = _tail_cache[key]
+    return {"api": sum(1 for k, ts in ev if k == "api" and t - ts <= 600), "long": sum(1 for k, ts in ev if k == "long" and t - ts <= 1800),
+            "compact": sum(1 for k, ts in ev if k == "compact" and t - ts <= 7200), "interrupt": max([ts for k, ts in ev if k == "interrupt"] or [0])}
+
+
+# ---------- model of the machine ----------
+def descendants(procs, pid):
+    kids, out = {}, []
+    for p in procs.values():
+        kids.setdefault(p["ppid"], []).append(p["pid"])
+    stack = list(kids.get(pid, []))
+    while stack:
+        x = stack.pop(); out.append(procs[x]); stack.extend(kids.get(x, []))
+    return out
+
+
+def chat_of(p, projs):
+    """A chat process: (kind 'vscode'|'desktop'|'headless', project, session id or '') or None."""
+    c = p["cmd"]
+    if "Helpers/disclaimer" in c or "sandbox-exec" in c.split(" ")[0]:
+        return None
+    first = c.split(" --")[0].strip()  # the executable; desktop paths contain spaces ("Application Support")
+    if " " in first and "claude.app/" not in first:
+        first = c.split(" ")[0]
+    desk = "claude.app/Contents/MacOS/claude" in first or "claude-code/" in first and first.endswith("/claude")
+    if not (first.endswith("/claude") or first == "claude" or desk):
+        return None
+    if re.search(r"\s-p\s|\s--print\b", c):
+        return ("headless", "", "")
+    sid = (re.search(r"--resume[= ](\S+)", c) or [None, ""])[1]
+    nm = re.search(r"--name[= ](\S+)", c)
+    proj = nm.group(1) if nm else ""
+    if not proj:
+        cwd = cwd_of(p["pid"])
+        for n in projs:
+            if cwd == str(DEV / n) or cwd.startswith(str(DEV / n) + "/"):
+                proj = n
+    if not proj and sid:
+        for n in projs:
+            if any((d / f"{sid}.jsonl").exists() for d in proj_dirs(n)):
+                proj = n
+    return ("desktop" if desk else "vscode", proj, sid)
+
+
+def app_name(cmd, is_vm=False):
+    """A readable name for the app a process belongs to (for the Mac-busy text)."""
+    if is_vm:
+        return "Docker VM"
+    m = re.search(r"([^/]+)\.app(?:/|$)", cmd)
+    nm = m.group(1) if m else re.sub(r"^.*/", "", cmd.split(" --")[0].strip())[:30]
+    return {"Visual Studio Code": "VS Code"}.get(nm, nm)
+
+
+# ---------- the registry: every Health item kind and every action, declared once ----------
+def ap_chat_alive(item, ctx):
+    return (True, "") if ctx.live_by_proj.get(item["project"]) else (False, f"no live {item['project'] or 'project'} chat process")
+
+
+def ap_interrupt(item, ctx):
+    ok, why = ap_chat_alive(item, ctx)
+    if not ok:
+        return ok, why
+    return (True, "") if ctx.working_now.get(item["project"]) else (False, "the chat is not in the middle of a turn: nothing to interrupt")
+
+
+def ap_fresh(item, ctx):
+    ok, why = ap_chat_alive(item, ctx)
+    if not ok:
+        return ok, why
+    if item["kind"] == "session_large" and ctx.working_now.get(item["project"]):
+        return False, "runs when the chat finishes its turn"
+    return True, ""
+
+
+def ap_proc(item, ctx):
+    p = ctx.procs.get(item["pid"]) if item["pid"] else None
+    return (True, "") if p and abs(p["start"] - item["start"]) <= 5 else (False, "that process is gone or changed; nothing done")
+
+
+def ap_stop_colima(item, ctx):
+    if not colima_running():
+        return False, "the Docker VM (Colima) is not running"
+    ok, rows = ctx.docker_ps()
+    if not ok:
+        return False, "could not ask Docker whether containers run"
+    return (False, f"{len(rows)} container(s) still run") if rows else (True, "")
+
+
+def ap_pause(item, ctx):
+    if (STATE / "agents.paused").exists():
+        return False, "new agents are already paused"
+    return (True, "") if ctx.live_agent_count() else (False, "none of our agents is running")
+
+
+def ap_drop(item, ctx):
+    return (True, "") if (item["project"], item.get("agent", "")) in ctx.dead else (False, "that agent record is not provably dead")
+
+
+# ---------- stray automation browsers and orphaned test runs (21 Oct 2026) ----------
+TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")
+BROWSER_RE = re.compile(r"Google Chrome|Chrome for Testing|chrome-headless-shell|chromium", re.I)
+UDD_RE = re.compile(r"(?:^| )--?user-data-dir=(\S+)")
+UDD_ANY = re.compile(r"(?:^| )--?user-data-dir\b")        # every spelling that names a profile, with or without a value
+
+
+def under_temp_root(path):
+    """True when `path` (symlinks and .. resolved) is inside /tmp, /private/tmp, /var/folders or /private/var/folders. Resolves only; touches nothing."""
+    if not path:
+        return False
+    r = os.path.realpath(str(path))
+    return any(r == t or r.startswith(t.rstrip("/") + "/") for t in {os.path.realpath(x) for x in TEMP_ROOTS} | set(TEMP_ROOTS))
+
+
+def udd_of(cmd):
+    """The profile folder Chrome really uses: the LAST --user-data-dir (Chrome takes the last one), not the first (L5)."""
+    ms = UDD_RE.findall(cmd)
+    return ms[-1].strip().strip("\"'") if ms else ""
+
+
+def temp_profile(cmd):
+    """True only for exactly ONE --user-data-dir that is inside a temp folder. Two or more occurrences are ambiguous (a decoy first, the real profile last): never temp, never killable."""
+    return len(UDD_ANY.findall(cmd)) == 1 and len(UDD_RE.findall(cmd)) == 1 and under_temp_root(udd_of(cmd))
+
+
+def is_automation_browser(p):
+    """The main process of a Chrome / Chrome for Testing started for automation (remote debugging port or headless); renderer and helper processes (--type=) are its children."""
+    c = p["cmd"]
+    return bool(BROWSER_RE.search(c)) and "--type=" not in c and ("--remote-debugging-port" in c or "--headless" in c)
+
+
+def _ours_test_all(path):
+    """The script is bin/test-all of this workspace, or of one of its git worktrees (<DEV>/.worktrees/<workspace name>/<x>/bin/test-all). A project's own test-all never is (L5)."""
+    try:
+        r = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    if r == os.path.realpath(str(WS / "bin" / "test-all")):
+        return True
+    wt = os.path.realpath(str(DEV / ".worktrees" / WS.name))
+    return r.startswith(wt + "/") and r.endswith("/bin/test-all") and r.count("/") == wt.count("/") + 3
+
+
+def is_testrun(p):
+    t = p["cmd"].split()
+    if not t:
+        return False
+    b = os.path.basename(t[0])
+    if b == "test-all":
+        return _ours_test_all(t[0])
+    return b.lower().startswith("python") and any(os.path.basename(x) == "test-all" and _ours_test_all(x) for x in t[1:3])
+
+
+def inside_dev(path):
+    """cwd of a process is inside a known workspace or worktree (the projects folder, or this workspace)."""
+    if not path:
+        return False
+    r = os.path.realpath(path)
+    return any(r == q or r.startswith(q.rstrip("/") + "/") for q in {os.path.realpath(str(DEV)), os.path.realpath(str(WS))})
+
+
+def ap_browser(item, ctx):
+    ok, why = ap_proc(item, ctx)
+    if not ok:
+        return ok, why
+    p = ctx.procs[item["pid"]]
+    if not is_automation_browser(p):
+        return False, "that process is not an automation browser any more; nothing done"
+    if not temp_profile(p["cmd"]):
+        return False, "its profile folder is not in a temp folder: shipm-watch never touches it"
+    return True, ""
+
+
+def ap_testrun(item, ctx):
+    ok, why = ap_proc(item, ctx)
+    if not ok:
+        return ok, why
+    p = ctx.procs[item["pid"]]
+    if not is_testrun(p) or not ctx.orphaned(p):
+        return False, "that is not an orphaned test-all run any more; nothing done"
+    if not inside_dev(cwd_of(p["pid"])):
+        return False, "its folder is not inside a known workspace or worktree: not touched"
+    return True, ""
+
+
+OPS = {
+    "interrupt": dict(executor="ext", wait_s=8, checks=1, destructive=False, applicable=ap_interrupt),
+    "relaunch": dict(executor="ext", wait_s=20, checks=3, destructive=True, applicable=ap_chat_alive),
+    "fresh": dict(executor="ext", wait_s=20, checks=3, destructive=True, applicable=ap_fresh),
+    "end-job": dict(executor="watch", wait_s=2, checks=1, destructive=True, applicable=ap_proc),
+    "end-proc": dict(executor="watch", wait_s=2, checks=1, destructive=True, applicable=ap_proc),
+    "quit-session": dict(executor="watch", wait_s=2, checks=1, destructive=True, applicable=ap_proc),
+    "close-duplicate": dict(executor="watch", wait_s=2, checks=1, destructive=True, applicable=ap_proc),
+    "stop-colima": dict(executor="watch", wait_s=5, checks=2, destructive=True, applicable=ap_stop_colima),
+    "pause-agents": dict(executor="watch", wait_s=1, checks=1, destructive=False, applicable=ap_pause),
+    "drop-record": dict(executor="watch", wait_s=0, checks=1, destructive=False, applicable=ap_drop),
+    "end-browser": dict(executor="watch", wait_s=3, checks=2, destructive=True, applicable=ap_browser),
+    "end-testrun": dict(executor="watch", wait_s=20, checks=2, destructive=True, applicable=ap_testrun),
+}
+# mode: auto (the watcher fixes it every scan) | fix (one Fix button runs `chain`) | info (grey, names the cause) | wait (a normal waiting state, grey).
+# dynamic=True: add() may override mode / chain / fix_label per item (host_busy is classified at run time); `also` lists the ops such an override may use.
+KINDS = {
+    "dead_agent": dict(mode="auto", sev="amber", chain=["drop-record"], verify="the record is gone from agents.json",
+                       fix_label="Drop the record of an agent that is no longer running",
+                       proof="Every chat process of the project started after the record was written and the agent's file is quiet.", info="",
+                       next="Nothing to do: the watcher drops it by itself."),
+    "leftover": dict(mode="fix", sev="amber", chain=["end-proc"], verify="the process is gone",
+                     fix_label="End the leftover process", proof="Its parent chat is dead (same pid and start time as recorded) and it is on the watcher's allowlist; automatic cleanup is off.", info="",
+                     next="End the leftover process by hand (Activity Monitor); it belongs to no live chat."),
+    "orphan": dict(mode="auto", sev="amber", chain=["end-proc"], verify="the process is gone",
+                   fix_label="End the leftover process", proof="Its parent chat is dead (same pid and start time as recorded) and it is on the watcher's allowlist.", info="",
+                   next="Nothing to do: the watcher ends it by itself."),
+    "frozen_agent": dict(mode="fix", sev="red", chain=["interrupt", "relaunch"], verify="the agent is no longer reported frozen",
+                         fix_label="Stop the step the chat is on, then reopen the chat on the same conversation",
+                         proof="The agent's file has not been written for 20+ minutes, nothing uses CPU, and a chat that could own it is still running.", info="",
+                         next="Quit the chat by hand; a record whose chat is gone is dropped by the watcher on the next scan."),
+    "frozen_chat": dict(mode="fix", sev="red", chain=["interrupt", "relaunch"], secondary=["fresh"], verify="the chat is no longer reported frozen",
+                        fix_label="Stop its step; if it stays stuck, reopen the chat on the same conversation",
+                        proof="Marked working, but nothing written for 20+ minutes and no child process uses CPU.", info="",
+                        next="Open the chat and type /resume, or start a fresh chat from the secondary button."),
+    "job_frozen": dict(mode="fix", sev="red", chain=["end-job"], verify="the process is gone",
+                       fix_label="End the silent background job", proof="No CPU and no new output for 30+ minutes.", info="",
+                       next="End the silent job by hand (Activity Monitor), then tell the chat to carry on."),
+    "context_full": dict(mode="fix", sev="amber", chain=["fresh"], verify="the newest conversation no longer shows 'too long' or repeated compactions",
+                         fix_label="Open a fresh chat that starts small from STATUS and memory", proof="The model reported 'Prompt is too long' or compacted repeatedly.", info="",
+                         next="Close the chat tab and open a new chat from the Projects button; the old conversation stays under /resume."),
+    "session_large": dict(mode="fix", sev="amber", chain=["fresh"], verify="the newest conversation is under 80 MB",
+                          fix_label="Open a fresh chat that starts small from STATUS and memory", proof="The conversation file is over 80 MB.", info="",
+                          next="Finish the current turn, then close the chat tab and open a new one from the Projects button."),
+    "duplicate": dict(mode="fix", sev="amber", chain=["close-duplicate"], verify="the desktop-app copy is gone",
+                      fix_label="Close the desktop-app copy; the VS Code chat keeps the conversation", proof="The same conversation runs in the desktop app and in VS Code.", info="",
+                      next="Quit the Claude desktop app by hand."),
+    "duplicate_tabs": dict(mode="fix", sev="amber", chain=["quit-session"], verify="the older chat process is gone",
+                           fix_label="Quit the older VS Code chat on this conversation", proof="Two VS Code chat processes share one conversation.", info="",
+                           next="Close one of the two chat tabs by hand."),
+    "idle_session": dict(mode="fix", sev="amber", chain=["quit-session"], verify="the chat process is gone",
+                         fix_label="Quit the idle chat to free its memory", proof="Not used for 24+ hours and it holds 300+ MB.", info="",
+                         next="Close the chat tab by hand."),
+    "playwright_dup": dict(mode="fix", sev="amber", chain=["end-proc"], verify="the extra browser server is gone",
+                           fix_label="End the extra browser server", proof="More than one Playwright server runs for one chat.", info="",
+                           next="Quit the extra `playwright-mcp` process in Activity Monitor (the newest one belongs to the chat)."),
+    "vm_idle": dict(mode="fix", sev="amber", chain=["stop-colima"], verify="the Docker VM process is gone",
+                    fix_label="Stop the idle Docker VM (start it again with `colima start`)", proof="Up 24+ hours, no container runs.", info="",
+                    next="Run `colima stop` in a terminal."),
+    "host_busy": dict(mode="info", sev="info", chain=[], dynamic=True, also=["stop-colima", "pause-agents"], verify="the Mac is no longer reported busy",
+                      fix_label="", proof="", info="The Mac is short of memory or CPU; the text names who uses it.",
+                      next="Quit the biggest app named in the text."),
+    "limit": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="", info="The plan's usage limit was reached; the chat continues by itself after the reset.", next=""),
+    "plan_approval": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="", info="A plan was shown; building waits for your words in the chat.", next=""),
+    "waiting_you": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="", info="Claude is waiting for your answer.", next=""),
+    "api_trouble": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="", info="The API returns errors; the chat retries by itself.", next=""),
+    "waiting_job": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="", info="The chat ended its turn waiting for a background job.", next=""),
+    # P5c/P6: change requests and the autopilot (spec p5 section 7, p6 section 7). Wait/info kinds stay grey (the contract); only stage_stuck has a button.
+    "stage_stuck": dict(mode="fix", sev="amber", chain=["interrupt"], verify="the CR's stage changed or the chat is no longer working",
+                        fix_label="Stop the step the chat is on so the lead can say where the CR is stuck",
+                        proof="Working for 30+ minutes, still writing, and the CR has had no stage change.", info="",
+                        next="Open the chat, press Esc, then ask the lead which step of the CR is stuck and why."),
+    "verify_failed_twice": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="",
+                                info="The test failed twice on the active change request; it is blocked until you choose.",
+                                next="Open the chat and choose: change the plan, fix it again, or stop the CR (shipm cr abandon in a terminal)."),
+    "autopilot_paused": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="",
+                             info="The manual autopilot finished a stage and waits for your word.",
+                             next="Open the chat and type next to let the manual autopilot run the following stage."),
+    "budget_reached": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="",
+                           info="The autopilot run ended because the weekly budget in its charter was used up.",
+                           next="Raise the charter budget or go back to guided."),
+    "autopilot_ended_time": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="",
+                                 info="The autopilot run ended because the time limit in its charter was reached.",
+                                 next="Look at the auto branch result, then start a new run with a longer time limit or go back to guided."),
+    "merge_waiting": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="",
+                          info="The autopilot finished a change request but cannot merge it yet: the main checkout is in use or has uncommitted changes on the same files.",
+                          next="Close the chat that uses the main checkout and commit or stash your changes there; the merge is retried at the autopilot's next Stop."),
+    "autopilot_stopped": dict(mode="wait", sev="info", chain=[], verify="", fix_label="", proof="",
+                              info="The autopilot run stopped on a hard rule and waits for your word.",
+                              next="Open the auto chat: type allow: H-xxxxxx to allow that one action, or charter: off."),
+    "cr_orphan": dict(mode="info", sev="info", chain=[], verify="", fix_label="", proof="",
+                      info="A change request is open but no chat has worked on it for a day.",
+                      next="Open the project's chat from its card and type /feature with no text to resume the CR."),
+    "stray_browser": dict(mode="fix", sev="amber", chain=["end-browser"], verify="the browser process is gone",
+                          fix_label="End the leftover automation browser (its profile is in a temp folder)",
+                          proof="An automation Chrome (remote debugging port or headless) is older than 30 minutes and its profile folder is in a temp folder; a browser with any other profile is only listed, never touched.", info="",
+                          next="Quit the browser by hand, or run `agent-browser close --all`. A browser with your own profile is not touched."),
+    "stray_testrun": dict(mode="fix", sev="amber", chain=["end-testrun"], verify="the test-all process is gone",
+                          fix_label="Stop the orphaned test run (it cleans up its own child processes)",
+                          proof="bin/test-all has run for 20+ minutes, its parent is gone (pid 1 or no such process) and it runs inside a known workspace or worktree.", info="",
+                          next="End the test-all process by hand (Activity Monitor), then check for leftover node or browser processes."),
+    "watcher_bug": dict(mode="info", sev="info", chain=[], verify="", fix_label="", proof="", info="The watcher raised a kind that has no contract in KINDS: a bug in bin/shipm-watch.", next="Tell the engineer."),
+}
+
+
+# Names (without .json) of state files written by our own tools; the cleanup below must never delete them.
+# tests/watch_test.py scans the code for every "<name>.json" written under the state dir and asserts it is listed here.
+STATE_KEEP = frozenset({"guard", "away", "plan", "ci", "idea-ask", "idea-prefs", "backlog-prefs", "health", "lineage", "watch-state", "away-decisions", "usage", "usage-counts", "ledger.summary", "ledger.offsets", "scorecard", "user-active", "events", "post-gate", "skills-uses", "skills-diff", "model-reset"})
+
+class Scan:
+    def __init__(self, dry=False, verify=False):
+        self.c, self.t, self.dry, self.verify = cfg(), now(), dry, verify
+        self.procs = read_ps(); self.projs = projects()
+        self.ws = jread(STATE / "watch-state.json", {}) or {}
+        self.lineage = jread(STATE / "lineage.json", {}) or {}
+        self.items, self.cleaned = [], []
+        self.chats, self.work_frozen, self.host = {}, {}, {}
+        self.working_now, self.live_by_proj, self.owners, self.dead, self.unowned, self.agent_recs = {}, {}, [], {}, [], {}
+        self.vm_pids = self.find_vm(); self.vm_claimed = set()
+
+    # --- bookkeeping ---
+    def alive(self, pid, start):
+        p = self.procs.get(int(pid)); return bool(p) and abs(p["start"] - start) <= 5
+
+    def find_vm(self):
+        """Colima's VM process: the Apple Virtualization VM that started together (within 15 s) with a `limactl hostagent` of the colima profile.
+        Any other Virtualization VM (a Parallels/UTM guest, ...) is just an app."""
+        agents = [p for p in self.procs.values() if HOSTAGENT_RE.search(p["cmd"]) and "colima" in p["cmd"]]
+        return {p["pid"] for p in self.procs.values() if VM_RE.search(p["cmd"]) and any(abs(p["start"] - a["start"]) <= 15 for a in agents)}
+
+    @property
+    def sane(self):
+        """The ps read can be trusted for proofs: not empty, and (in real runs) it contains this very process."""
+        return bool(self.procs) and (bool(env("SHIPMIRACLE_PS")) or os.getpid() in self.procs)
+
+    def add(self, kind, sev, project, title, why, since=None, pid=0, start=0, extra=None, mode=None, chain=None, fix_label=None, proof=None, info=None, nxt=None):
+        reg = KINDS.get(kind)
+        if reg is None:                                                       # never silent, never a crash
+            log(f"BUG: kind {kind!r} has no contract in KINDS")
+            title, why, extra, kind, reg = f"watcher bug: {kind} has no contract", f"bin/shipm-watch raised '{kind}' but KINDS has no entry for it.", dict(extra or {}, bug_kind=kind), "watcher_bug", KINDS["watcher_bug"]
+            mode = chain = None
+        mode = mode or reg["mode"]; chain = list(reg["chain"] if chain is None else chain)
+        secondary = [o for o in reg.get("secondary", []) if o not in chain]
+        agent = (extra or {}).get("agent", "")
+        # the id never contains the start time (etime is whole seconds, so it drifts by 1 s between scans); host_busy is one item whatever the lead is
+        iid = hashlib.sha1((f"{kind}|{'' if kind == 'host_busy' else project}|{pid}" + (f"|{agent}" if agent else "")).encode()).hexdigest()[:10]
+        info_only = mode in ("info", "wait")
+        item = {"id": iid, "kind": kind, "severity": "info" if info_only else sev, "project": project, "title": title, "why": why, "since": int(since or self.t),
+                "actions": chain + secondary, "pid": pid, "start": int(start), "mode": mode, "chain": chain, "info_only": info_only,
+                "fix_label": fix_label if fix_label is not None else reg["fix_label"], "proof": proof if proof is not None else reg["proof"],
+                "info": info if info is not None else reg["info"], "verify_text": reg["verify"], "next": nxt if nxt is not None else reg["next"], **(extra or {})}
+        starts = [q["start"] for q in self.live_by_proj.get(project, [])]
+        item["chat_start"] = int(max(starts)) if starts else 0                      # the newest chat of the project when this was raised (Fresh chat is verified against it)
+        item["destructive"] = {a: OPS[a]["destructive"] for a in item["actions"]}
+        item["destructive_chain"] = any(OPS[a]["destructive"] for a in chain)
+        item["impact"] = {a: self.impact(a, item) for a in item["actions"]}
+        item["safe"] = {a: SAFE.get(a, "") for a in item["actions"]}
+        item["can"] = {a: list(OPS[a]["applicable"](item, self)) for a in item["actions"]}
+        item["fixable_now"] = mode == "auto" or (mode == "fix" and any(item["can"][o][0] for o in chain))
+        item["why_not"] = "; ".join(f"{o}: {item['can'][o][1]}" for o in chain if not item["can"][o][0]) if mode == "fix" and not item["fixable_now"] else ""
+        item["recommended"] = chain[0] if mode in ("fix", "auto") and chain else ""
+        item["reco_why"] = item["fix_label"] if item["recommended"] else ""
+        self.items.append(item)
+
+    def impact(self, op, item):
+        """One plain sentence per button: what pressing it does and what it costs. Shown before the owner confirms."""
+        pr = self.procs.get(item["pid"]) if item["pid"] else None
+        what = f"{re.sub(r'^.*/', '', pr['cmd'].split(' ')[0])} (pid {pr['pid']}, {pr['rss']:.0f} MB)" if pr else "the process"
+        wip = "Uncommitted work is first saved to a wip/frozen branch (your files are not touched). "
+        return {
+            "interrupt": "Sends Esc to the chat: stops the step it is on. Nothing is deleted; the chat stays open.",
+            "relaunch": wip + "Closes this chat and opens it again on the same conversation. A tool call or background job running in it is cut off.",
+            "fresh": wip + "Closes this chat and opens a new, small conversation that starts from STATUS. The old one stays on disk (/resume).",
+            "end-job": wip + f"Ends {what}. The chat that waits for it carries on.",
+            "end-proc": f"Ends {what}. It belongs to no live chat; frees its memory.",
+            "quit-session": wip + f"Quits the chat {what}. Reopen it from the Projects button; the conversation stays on disk.",
+            "close-duplicate": wip + f"Quits the desktop-app copy {what}. The VS Code chat of the same conversation keeps going.",
+            "stop-colima": "Stops the Docker VM (no containers are running). Frees its memory; start it again with `colima start`.",
+            "pause-agents": "Nothing running is stopped. No NEW sub-agents start in any project until you press Resume; chats keep working.",
+            "drop-record": "Removes the record of an agent that is no longer running. No process is touched.",
+            "end-browser": f"Ends {what} and its helper processes. Only automation browsers with a temp-folder profile qualify; a browser with another profile is never touched.",
+            "end-testrun": f"Sends SIGTERM to {what} (an orphaned bin/test-all). It stops its own test processes and cleans up; leftovers are listed afterwards.",
+        }.get(op, "")
+
+    def owner_of(self, p):
+        """Which project a process belongs to: walk up to a chat process (or a recorded lineage entry)."""
+        q = p
+        for _ in range(12):
+            if q.get("chat"):
+                return q["chat"]["project"] or "other"
+            lin = self.lineage.get(str(q["pid"]))
+            if lin and lin.get("project") and abs(lin["start"] - q["start"]) < 5:
+                return lin["project"]
+            q = self.procs.get(q["ppid"])
+            if not q:
+                break
+        return ""
+
+    def top_users(self, n=3):
+        by, proc = {}, []
+        for p in self.procs.values():
+            if INFRA.search(p["cmd"]) and "playwright" not in p["cmd"]:
+                continue
+            o = self.owner_of(p) or "other apps"
+            b = by.setdefault(o, {"mb": 0.0, "cpu": 0.0, "n": 0, "big": {}}); b["mb"] += p["rss"]; b["cpu"] += p["cpu"]; b["n"] += 1
+            nm = re.sub(r"\.app/.*$", "", p["cmd"].split(" --")[0]).rsplit("/", 1)[-1][:30]; b["big"][nm] = b["big"].get(nm, 0) + p["rss"]
+        for b in by.values():
+            b["big"] = ", ".join(f"{k} {v / 1024:.1f} GB" for k, v in sorted(b["big"].items(), key=lambda kv: -kv[1])[:3] if v > 300)
+        return sorted(by.items(), key=lambda kv: -kv[1]["mb"])[:n]
+
+    def outside_apps(self):
+        """Apps outside every project, biggest first: [(name, {"mb", "vm"})]."""
+        by = {}
+        for p in self.procs.values():
+            if (INFRA.search(p["cmd"]) and "playwright" not in p["cmd"]) or self.owner_of(p):
+                continue
+            nm = app_name(p["cmd"], p["pid"] in self.vm_pids); b = by.setdefault(nm, {"mb": 0.0, "vm": nm == "Docker VM"}); b["mb"] += p["rss"]
+        return sorted(by.items(), key=lambda kv: -kv[1]["mb"])
+
+    def cpu_busy(self, pids):
+        hist = self.ws.setdefault("cpu", {})
+        return any(max(hist.get(str(p), [0])[-3:] or [0]) >= self.c["busy_cpu"] for p in pids)
+
+    def docker_ps(self, fresh=None):
+        """(ok, rows) from `docker ps`, cached 5 minutes in the watch state; verify / can / act scans always ask again."""
+        fresh = self.verify if fresh is None else fresh
+        c = self.ws.get("docker")
+        if not fresh and isinstance(c, dict) and self.t - c.get("ts", 0) < 300:
+            return c["ok"], [tuple(r) for r in c["rows"]]
+        ok, rows = docker_ask(); self.ws["docker"] = {"ts": self.t, "ok": ok, "rows": [list(r) for r in rows]}
+        return ok, rows
+
+    def kill(self, p, why):
+        """End one process. The pid's start time is read again right before SIGTERM and before SIGKILL; if it moved the pid was reused: nothing is sent."""
+        shown = red(p["cmd"][:70])
+        if env("SHIPMIRACLE_KILL_LOG"):
+            with open(env("SHIPMIRACLE_KILL_LOG"), "a") as f:
+                f.write(f"{p['pid']} {why}\n")
+        else:
+            for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 0)):
+                rc, out = sh(["/bin/ps", "-o", "etime=", "-p", str(p["pid"])], 4)
+                if rc != 0 or not out.strip():
+                    break                                                        # already gone
+                try:
+                    start = time.time() - etime_s(out.strip())
+                except Exception:
+                    log(f"NOT ended {why}: pid {p['pid']}: could not read its start time"); return False
+                if abs(start - p["start"]) > 5:
+                    log(f"NOT ended {why}: pid {p['pid']} now has a different start time (pid reuse)"); return False
+                try:
+                    os.kill(p["pid"], sig)
+                except Exception:
+                    break
+                for _ in range(wait):
+                    time.sleep(1)
+                    try:
+                        os.kill(p["pid"], 0)
+                    except Exception:
+                        break
+                else:
+                    continue
+                break
+        log(f"ended {why}: pid {p['pid']} {shown}"); self.cleaned.append({"ts": int(self.t), "what": why, "pid": p["pid"], "cmd": shown})
+        return True
+
+    def owners_of(self, proj):
+        """Claude processes that could own project `proj`'s agents: named for it, started in its folder, or with an unknown folder (owner of every project)."""
+        return [p for p, pr in self.owners if pr is None or pr == proj]
+
+    def live_agent_count(self):
+        return sum(1 for proj, ag in self.agent_recs.items() for aid, a in ag.items() if (proj, aid) not in self.dead and isinstance(a, dict) and self.t - a.get("started", self.t) < 3 * 3600)
+
+    # --- the scan ---
+    def observe(self):
+        """Everything up to the item list (no writes, apart from in-memory state)."""
+        c, t = self.c, self.t
+        cpu = self.ws.setdefault("cpu", {})
+        if not self.verify:                                                   # a verify scan adds no CPU history
+            for p in self.procs.values():                                     # short CPU history for busy / hog decisions
+                if p["cpu"] >= 1.0 or str(p["pid"]) in cpu:
+                    cpu.setdefault(str(p["pid"]), []).append(p["cpu"]); cpu[str(p["pid"])] = cpu[str(p["pid"])][-10:]
+            for k in [k for k in cpu if int(k) not in self.procs]:
+                del cpu[k]
+        sessions = {}
+        for p in self.procs.values():
+            ch = chat_of(p, self.projs)
+            if not ch:
+                continue
+            kind, proj, sid = ch
+            if kind == "headless" or not proj:                                # owner by folder; an unknown folder owns every project
+                cw = cwd_of(p["pid"]); pr = None if not cw else next((n for n in self.projs if cw == str(DEV / n) or cw.startswith(str(DEV / n) + "/")), "")
+                self.owners.append((p, pr))
+                if kind == "headless":
+                    continue
+            else:
+                self.owners.append((p, proj))
+            p["chat"] = {"kind": kind, "project": proj, "sid": sid}
+            tr = transcripts(proj) if proj else None
+            if not sid and tr:
+                sid = tr["sid"]
+            p["chat"]["sid"] = sid
+            if sid:
+                sessions.setdefault(sid, []).append(p)
+            for d in descendants(self.procs, p["pid"]):                      # lineage: who spawned what (proof for orphans, safe against pid reuse)
+                self.lineage[str(d["pid"])] = {"start": d["start"], "cmd": red(d["cmd"])[:120], "claude": p["pid"], "claude_start": p["start"], "project": proj, "seen": t}
+        live = [p for p in self.procs.values() if p.get("chat")]
+        for p in live:
+            self.live_by_proj.setdefault(p["chat"]["project"], []).append(p)
+        for proj in self.projs:
+            ag = jread(STATE / f"{proj}.agents.json", {})
+            self.agent_recs[proj] = {k: v for k, v in ag.items() if isinstance(v, dict)} if isinstance(ag, dict) else {}
+        self.find_dead()
+        for proj in self.projs:
+            self.judge_project(proj, [p for p in live if p["chat"]["project"] == proj])
+        self.judge_sessions(sessions); self.judge_playwright(live); self.judge_strays(); self.judge_host(); self.judge_vm(live)
+        self.judge_leftovers(); self.collect_unowned()
+        self.host["unowned"] = self.unowned[:8]
+        self.report_dead()
+
+    def run(self):
+        self.observe()
+        if not self.dry:
+            if self.auto_on:
+                self.drop_dead(); self.housekeeping()
+        self.finish()
+
+    # --- provably dead agent records ---
+    def find_dead(self):
+        """A record is dead when the ps read is sane, it has a start time, every possible owner chat started more than 10 s after it (or there is none),
+        and the agent's file is missing or quiet for 120 s. Nothing is concluded when ps looks broken or the switch auto_dead_agents is off."""
+        if not self.sane or not self.c.get("auto_dead_agents", True):
+            return
+        if any(self.agent_recs.values()) and not self.owners:
+            return                                                           # records exist but no chat process was recognised anywhere: ps cannot be trusted this scan
+        t = self.t
+        for proj, ag in self.agent_recs.items():
+            if not ag:
+                continue
+            tr = transcripts(proj); ow = self.owners_of(proj)
+            for aid, a in ag.items():
+                st0 = a.get("started")
+                if not isinstance(st0, (int, float)) or st0 <= 0 or any(o["start"] <= st0 + 10 for o in ow):
+                    continue
+                fw = tr["agents"].get(aid) if tr else None
+                if fw is not None and t - fw < 120:
+                    continue
+                newest = max((o["start"] for o in ow), default=None)
+                self.dead[(proj, aid)] = {"type": a.get("type", "agent"), "started": st0,
+                                          "evidence": f"record started {hhmm(st0)}, " + (f"the chat started {hhmm(min(o['start'] for o in ow))}" if ow else "no chat process of this project runs") + (f" (newest {hhmm(newest)})" if len(ow) > 1 else "")}
+
+    @property
+    def auto_on(self):
+        return bool(self.c["auto"]) and not (STATE / "auto-clean.off").exists()
+
+    def report_dead(self):
+        if self.dry or not self.auto_on:                                      # --dry, or the owner switched automatic cleanup off: say it, change nothing (a Fix button remains)
+            for (proj, aid), ev in self.dead.items():
+                auto = self.auto_on
+                self.add("dead_agent", "amber", proj, f"dead agent record: {ev['type']}", f"Provably dead: {ev['evidence']}. " + ("The watcher drops it by itself." if auto else "Automatic cleanup is off: press Fix to drop it."),
+                         extra={"agent": aid}, proof=ev["evidence"], mode="auto" if auto else "fix")
+
+    def drop_dead(self, only=None):
+        """Drop dead records (all of them, or only `only` = (project, agent)); read-modify-write under <project>.agents.json.lock. Respects the owner's switches."""
+        by = {}
+        for (proj, aid) in self.dead:
+            if only is None or (proj, aid) == only:
+                by.setdefault(proj, []).append(aid)
+        for proj, aids in by.items():
+            f = STATE / f"{proj}.agents.json"
+            with AgentsLock(proj):
+                cur = jread(f, {})
+                if not isinstance(cur, dict):
+                    continue
+                gone = [k for k in aids if k in cur]
+                if not gone:
+                    continue
+                jwrite(f, {k: v for k, v in cur.items() if k not in gone})          # re-read just now; only these ids are removed
+            for aid in gone:
+                ev = self.dead[(proj, aid)]
+                self.cleaned.append({"ts": int(self.t), "what": "dead agent record", "pid": 0, "cmd": f"{proj}: {ev['type']} ({ev['evidence']})"})
+                log(f"dropped dead agent record {proj}/{ev['type']} ({ev['evidence']})")
+
+    def judge_project(self, proj, chats):
+        c, t = self.c, self.t
+        tr = transcripts(proj)
+        st = jread(STATE / f"{proj}.json", {}) or {}
+        state = st.get("state", "idle")
+        working = state == "working" and t - st.get("ts", 0) < 12 * 3600
+        ow = self.owners_of(proj)
+        if working and self.sane and (not ow or st.get("ts", 0) < min(o["start"] for o in ow)):
+            working = False                                                    # a 'working' written before the chat process started (or with no chat at all) is stale
+        quiet = t - tr["newest"] if tr else None
+        limit = jread(STATE / f"{proj}.limit.json", {}) or {}
+        sig = tail_signals(tr["path"], tr["lead"], t) if tr and (t - tr["lead"] < 900 or working) else {"api": 0, "long": 0, "compact": 0, "interrupt": 0}
+        if working and sig["interrupt"] > st.get("ts", 0):
+            working = False                                                    # Esc was pressed after the last 'working' note: the turn is over
+        self.working_now[proj] = working
+        info = {"state": "ok", "size_mb": tr["size_mb"] if tr else 0, "quiet_s": int(quiet) if quiet is not None else None, "chats": len(chats),
+                "interrupted_at": int(sig["interrupt"]), "lead_mtime": int(tr["lead"]) if tr else 0, "working": working}
+        fresh_chat = bool(tr and chats and max(ch["start"] for ch in chats) > tr["lead"])   # a chat started after the newest conversation was last written: Fresh chat was done (the file is not replaced until the first message)
+        pend = [f for f in STATE.glob("plan-pending.*") if tr and f.name.split(".", 1)[1] == tr["sid"] and t - f.stat().st_mtime < 6 * 3600]
+        kids = [d for ch in chats for d in descendants(self.procs, ch["pid"]) if not INFRA.search(d["cmd"])]
+        busy = self.cpu_busy([d["pid"] for d in kids])
+        if limit.get("until", 0) > t:
+            info["state"] = "limit"; self.add("limit", "info", proj, f"usage limit until {time.strftime('%H:%M', time.localtime(limit['until']))}", "The plan's limit was reached; the chat continues by itself after the reset.", since=limit.get("ts"))
+        elif pend:
+            info["state"] = "plan_approval"; self.add("plan_approval", "info", proj, "waiting for your plan approval", "A plan was shown; building waits for your words in the chat.", since=pend[0].stat().st_mtime)
+        elif state == "needs-input":
+            info["state"] = "waiting_you"; self.add("waiting_you", "info", proj, "waiting for you", st.get("message") or "Claude is waiting for your answer.", since=st.get("ts"))
+        elif sig["api"] >= c["api_errors"]:
+            info["state"] = "api"; self.add("api_trouble", "info", proj, "API trouble", f"{sig['api']} API errors in 10 minutes; it retries by itself.")
+        elif (sig["long"] or sig["compact"] >= c["compactions"]) and not fresh_chat:
+            info["state"] = "context"; self.add("context_full", "amber", proj, "context full", "The conversation is too long for the model: a fresh chat starts from STATUS and memory.")
+        elif working and tr and quiet is not None and quiet >= c["frozen_min"] * 60 and not busy:
+            info["state"] = "frozen"; self.add("frozen_chat", "red", proj, f"frozen {int(quiet // 60)} min", f"Marked working but nothing written for {int(quiet // 60)} min and nothing is using CPU.", since=tr["newest"])
+        elif not working and kids and any(d["age"] >= 600 for d in kids):
+            old = max(d["age"] for d in kids)
+            info["state"] = "job"; self.add("waiting_job", "info", proj, f"waiting on a job {int(old // 60)} min", "The chat ended its turn waiting for a background job.", since=t - old)
+        if tr and tr["size_mb"] >= c["session_large_mb"] and info["state"] not in ("frozen",) and not fresh_chat:
+            self.add("session_large", "amber", proj, f"session large ({int(tr['size_mb'])} MB)", "A huge conversation resumes slowly and often hits the context limit: a fresh chat starts from STATUS and memory.")
+        if tr:                                                                # agents that could still be alive
+            for aid, a in self.agent_recs.get(proj, {}).items():
+                f = tr["agents"].get(aid)
+                if (proj, aid) in self.dead:
+                    continue
+                if f is not None and t - f >= c["agent_frozen_min"] * 60 and not busy and t - a.get("started", t) < c["stale_agent_h"] * 3600:
+                    self.add("frozen_agent", "red", proj, f"agent frozen {int((t - f) // 60)} min: {a.get('type', 'agent')}", "The agent's file has not been written to and nothing is using CPU.", since=f, pid=0, start=a.get("started", 0), extra={"agent": aid})
+        for p in kids:                                                          # background jobs that went silent
+            if p["age"] >= c["job_age_h"] * 3600 and max((self.ws["cpu"].get(str(p["pid"]), [p["cpu"]]))[-3:]) < 1.0:
+                out = self.newest_output(proj)
+                if out is None or t - out >= c["job_silent_min"] * 60:
+                    self.add("job_frozen", "red", proj, f"job silent {int(p['age'] // 3600)} h", f"{red(p['cmd'])[:60]}: no CPU, no new output for {c['job_silent_min']}+ min.", since=t - p["age"], pid=p["pid"], start=p["start"])
+        self.judge_cr(proj, info, working, tr, chats)
+        info["idle_s"] = int(quiet) if quiet is not None else None
+        self.chats[proj] = info
+        self.work_frozen[proj] = (working, info["state"] == "frozen")
+
+    def judge_cr(self, proj, info, working, tr, chats):
+        """Change-request and autopilot kinds. Read-only: the log through shipmiracle.playbook.store.load, the run state through shipmiracle.autopilot.state.read.
+        Silent when the project has no CR log / no autopilot state file, or when anything cannot be read."""
+        t = self.t
+        try:
+            pd = DEV / proj
+            if shipmiracle_cr is not None and shipmiracle_cr.log_path(pd, STATE).exists():
+                work = shipmiracle_cr.load(pd, STATE)
+                act = next((c for c in work["crs"] if c["id"] == work.get("active")), None)
+                last = work.get("updated") or 0
+                if act is not None and last:
+                    quiet = t - last
+                    if act["status"] == "open" and not act["hold"] and working and info["state"] == "ok" and quiet >= 30 * 60:
+                        self.add("stage_stuck", "amber", proj, f"CR step stuck {int(quiet // 60)} min", f"{act['id']} has had no stage change for {int(quiet // 60)} min while the chat is working.", since=last, extra={"cr": act["id"]})
+                    if act["status"] == "blocked" and act.get("blocked") == "verify_twice":
+                        self.add("verify_failed_twice", "info", proj, f"{act['id']}: test failed twice", "The test failed twice; the CR waits for your choice.", since=last, extra={"cr": act["id"]})
+                    if act["status"] == "open" and act["hold"] and not working:
+                        self.add("autopilot_paused", "info", proj, f"{act['id']}: waiting for 'next'", "The manual autopilot stopped after a stage and waits for your word.", since=last, extra={"cr": act["id"]})
+                    ref = tr["newest"] if tr else last
+                    if act["status"] == "open" and not chats and t - ref > 24 * 3600:
+                        self.add("cr_orphan", "info", proj, f"{act['id']} open, no chat for {int((t - ref) // 3600)} h", "A change request is open but no chat has worked on it for a day.", since=ref, extra={"cr": act["id"]})
+        except Exception as e:
+            log(f"judge_cr(cr) {proj}: {type(e).__name__}")
+        try:                                                                  # only when the autopilot state file exists
+            if shipmiracle_ap is not None and shipmiracle_projects is not None:
+                st = shipmiracle_ap.read(shipmiracle_projects.project_id(DEV / proj), STATE)
+                if st is not None:
+                    stop = st.get("stop") if isinstance(st.get("stop"), dict) else None
+                    hid = stop.get("id") if stop and isinstance(stop.get("id"), str) and re.fullmatch(r"H-[0-9a-f]{6}", stop["id"]) else None
+                    if st["state"] == "paused" and hid:
+                        self.add("autopilot_stopped", "info", proj, f"autopilot stopped ({hid})", (stop.get("text") or "A hard rule stopped the autopilot run.")[:160], since=stop.get("ts"),
+                                 extra={"stop_id": hid}, nxt=KINDS["autopilot_stopped"]["next"].replace("H-xxxxxx", hid))
+                    if st["state"] == "ended" and st.get("ended_reason") == "time" and t - (st.get("ended_ts") or 0) < 24 * 3600:
+                        self.add("autopilot_ended_time", "info", proj, "autopilot ended: time limit reached", "The autopilot run ended because the time limit in its charter was reached.", since=st.get("ended_ts"))
+                    mw = self.merge_waiting_event(shipmiracle_projects.project_id(DEV / proj))
+                    if mw is not None and st["state"] != "ended":
+                        self.add("merge_waiting", "info", proj, f"{str(mw.get('cr') or 'CR')[:20]}: merge waiting", ("Merge waiting: " + str(mw.get("why") or ""))[:160], since=mw.get("ts"), extra={"cr": str(mw.get("cr") or "")[:20]})
+                    if st["state"] == "ended" and st.get("ended_reason") == "budget" and t - (st.get("ended_ts") or 0) < 24 * 3600:
+                        self.add("budget_reached", "info", proj, "autopilot budget reached", "The autopilot run ended because the weekly budget in its charter was used up.", since=st.get("ended_ts"))
+        except Exception as e:
+            log(f"judge_cr(autopilot) {proj}: {type(e).__name__}")
+
+    def merge_waiting_event(self, pid, window=6 * 3600):
+        """The newest `autopilot.merge_waiting` event of this project id in the last `window` s, unless an `autopilot.merged` came after it; else None.
+        Read-only through shipmiracle.events.tail; any failure = None."""
+        try:
+            from shipmiracle import events as shipmiracle_events
+            last = None
+            for e in shipmiracle_events.tail(400, STATE):
+                if e.get("project") != pid or not isinstance(e.get("ts"), (int, float)):
+                    continue
+                if e.get("kind") == "autopilot.merge_waiting" and self.t - e["ts"] < window:
+                    d = e.get("data") if isinstance(e.get("data"), dict) else {}
+                    last = {"ts": e["ts"], "cr": d.get("cr"), "why": d.get("why")}
+                elif e.get("kind") == "autopilot.merged":
+                    last = None
+            return last
+        except Exception as e:
+            log(f"merge_waiting_event: {type(e).__name__}")
+            return None
+
+    def newest_output(self, proj):
+        best = None
+        try:
+            for f in TMP.rglob("*.output"):
+                if proj.replace(".", "-") in str(f.parent):
+                    m = f.stat().st_mtime; best = m if best is None or m > best else best
+        except Exception:
+            pass
+        return best
+
+    def judge_sessions(self, sessions):
+        c, t = self.c, self.t
+        for sid, plist in sessions.items():
+            if len(plist) < 2:
+                continue
+            desk = [p for p in plist if p["chat"]["kind"] == "desktop"]; vs = [p for p in plist if p["chat"]["kind"] == "vscode"]
+            proj = plist[0]["chat"]["project"]
+            if desk and vs:
+                for p in desk:
+                    self.add("duplicate", "amber", proj, "same conversation open twice", f"Also running in the Claude desktop app (pid {p['pid']}, up {int(p['age'] // 3600)} h): two writers on one transcript.", pid=p["pid"], start=p["start"])
+            elif len(vs) > 1:
+                older = max(vs, key=lambda p: p["age"])
+                self.add("duplicate_tabs", "amber", proj, "two chats on one conversation", f"Two VS Code chats share one conversation (the older is pid {older['pid']}, up {int(older['age'] // 3600)} h).", pid=older["pid"], start=older["start"])
+        for p in [p for p in self.procs.values() if p.get("chat")]:
+            tr = transcripts(p["chat"]["project"]) if p["chat"]["project"] else None
+            if tr and self.t - tr["newest"] >= c["idle_session_h"] * 3600 and p["rss"] > 300 and p["age"] > c["idle_session_h"] * 3600:
+                self.add("idle_session", "amber", p["chat"]["project"], f"idle chat {int((self.t - tr['newest']) // 3600)} h, {int(p['rss'])} MB", "A chat nobody used for a day still holds memory.", pid=p["pid"], start=p["start"])
+
+    def orphaned(self, p):
+        return p["ppid"] <= 1 or p["ppid"] not in self.procs
+
+    def judge_strays(self):
+        """Automation browsers older than stray_browser_min and orphaned bin/test-all runs older than stray_testrun_min. Browsers with a non-temp profile and test runs outside a
+        known workspace are listed (grey) and never fixable."""
+        if not self.sane:
+            return
+        bmin, tmin = self.c.get("stray_browser_min", 30) * 60, self.c.get("stray_testrun_min", 20) * 60
+        for p in sorted(self.procs.values(), key=lambda x: x["pid"]):
+            if is_automation_browser(p) and p["age"] >= bmin and not INFRA.search(p["cmd"].split(" --")[0]):
+                udd = udd_of(p["cmd"]); temp = temp_profile(p["cmd"])
+                n = sum(1 for _ in descendants(self.procs, p["pid"]))
+                self.add("stray_browser", "amber", "", f"leftover automation browser (pid {p['pid']})",
+                         f"An automation browser has run for {p['age'] // 60} min with {'a temp' if temp else 'another'} profile folder ({n} helper process(es)).",
+                         pid=p["pid"], start=p["start"], extra={"profile": red(udd)[:120], "temp_profile": temp},
+                         **({} if temp else dict(mode="info", chain=[], info="Its profile folder is not in a temp folder, so shipm-watch lists it and never touches it.",
+                                                 nxt="Quit it by hand when you are done with it.")))
+            if is_testrun(p) and p["age"] >= tmin and self.orphaned(p):
+                inside = inside_dev(cwd_of(p["pid"]))
+                self.add("stray_testrun", "amber", "", f"orphaned test run (pid {p['pid']})",
+                         f"bin/test-all has run for {p['age'] // 60} min and its parent is gone.", pid=p["pid"], start=p["start"],
+                         **({} if inside else dict(mode="info", chain=[], info="It does not run inside a known workspace or worktree, so shipm-watch only lists it.",
+                                                   nxt="End it by hand if it is yours.")))
+
+    def judge_playwright(self, live):
+        by = {}
+        for p in self.procs.values():
+            if re.search(r"playwright-mcp", p["cmd"]) and "npm exec" not in p["cmd"]:
+                a = p
+                while a and a["ppid"] in self.procs and not a.get("chat"):
+                    a = self.procs[a["ppid"]]
+                by.setdefault(a["pid"] if a and a.get("chat") else 0, []).append(p)
+        for cp, lst in by.items():
+            if cp and len(lst) > 1:
+                extra = sorted(lst, key=lambda x: x["start"])[:-1]
+                for p in extra:
+                    self.add("playwright_dup", "amber", self.procs[cp]["chat"]["project"], "extra Playwright server", "More than one browser server for one chat.", pid=p["pid"], start=p["start"])
+
+    def judge_host(self):
+        c, h = self.c, host_readings()
+        self.host = dict(h)
+        bad = h["swap_pct"] > c["host_swap_pct"] or h["free_pct"] < c["host_free_pct"] or h["load"] > c["host_load_x"] * h["cores"]
+        ok = h["swap_pct"] < c["host_swap_clear"] and h["free_pct"] > c["host_free_clear"] and h["load"] < c["host_load_clear"] * h["cores"]
+        n = self.ws.get("host_bad", 0)
+        n = n + 1 if bad else (0 if ok else n)
+        if self.verify:
+            n = 0 if ok else self.ws.get("host_bad", 0)                        # a verify / can / act scan never advances (or stores) the hysteresis counter
+        else:
+            self.ws["host_bad"] = n
+        self.host["busy"] = n >= c["host_scans"]
+        if not self.host["busy"]:
+            return
+        why = []
+        if h["swap_pct"] > c["host_swap_pct"]: why.append(f"swap {int(h['swap_pct'])} %")
+        if h["free_pct"] < c["host_free_pct"]: why.append(f"memory free {int(h['free_pct'])} %")
+        if h["load"] > c["host_load_x"] * h["cores"]: why.append(f"load {h['load']:.1f}")
+        head = ", ".join(why or [f"swap {int(h['swap_pct'])} %", f"memory free {int(h['free_pct'])} %"]) + ". "
+        top = self.top_users(); apps = self.outside_apps()
+        first = top[0][0] if top else ""
+        lead = first if first not in ("other apps", "other") else ""
+        who = "; ".join(f"{o}: {b['mb'] / 1024:.1f} GB, {b['cpu']:.0f} % CPU" + (f" ({b['big']})" if o == "other apps" and b["big"] else f", {b['n']} processes") for o, b in top)
+        app_txt = lambda skip=0: "; ".join(f"{n} {b['mb'] / 1024:.1f} GB" for n, b in apps[skip:skip + 3])
+        mode = chain = fix_label = None; sev = "info"; cause = "apps"
+        nxt = "Quit the biggest app named in the text."
+        title = "Mac busy" + (f" (most used by {lead})" if lead else " (mostly apps outside your projects)" if first == "other apps" else "")
+        text = head + "Using the most: " + who + ". Heavy jobs (benchmarks, integration runs) should wait."
+        if apps and apps[0][1]["vm"]:                                           # (a)/(b): the Docker VM is the biggest app
+            vm = apps[0][1]; ok_d, rows = self.docker_ps()
+            title = f"Mac busy (Docker VM {vm['mb'] / 1024:.1f} GB)"; lead = ""
+            if not ok_d:
+                cause = "docker_unknown"; nxt = "Start Colima (`colima start`) or open Docker, then look at Health again; until then nothing can be said about the containers."; text = head + f"Docker VM {vm['mb'] / 1024:.1f} GB is the biggest user, but I could not ask Docker whether containers run. Others: {app_txt(1)}."
+            elif not rows:
+                cause = "vm_idle"; mode, chain, sev = "fix", ["stop-colima"], "amber"; fix_label = "Stop the idle Docker VM (start it again with `colima start`)"; nxt = "Run `colima stop` in a terminal."
+                self.vm_claimed |= self.vm_pids
+                text = head + f"Docker VM {vm['mb'] / 1024:.1f} GB runs no containers. Others: {app_txt(1)}."
+            else:
+                cause = "vm_containers"; nxt = "Stop the containers you do not need: `docker --context colima ps`, then `docker stop <name>`."; groups = {}
+                for nm, wd in rows:
+                    pr = next((q for q in self.projs if wd == str(DEV / q) or wd.startswith(str(DEV / q) + "/")), "") or "(no compose project)"
+                    groups.setdefault(pr, []).append(nm)
+                cont = "; ".join(f"{len(v)} container{'s' if len(v) != 1 else ''} of {k} ({', '.join(v[:3])}{', …' if len(v) > 3 else ''})" for k, v in groups.items())
+                text = head + f"Docker VM {vm['mb'] / 1024:.1f} GB runs {cont}; {app_txt(1)}. Stop them in Docker if you do not need them."
+        elif self.live_agent_count() and not (STATE / "agents.paused").exists() and top and sum(b["mb"] for o, b in top if o not in ("other apps", "other")) >= 0.3 * sum(b["mb"] for o, b in top):
+            cause = "agents"; mode, chain, sev = "fix", ["pause-agents"], "amber"; fix_label = "Pause new agents until the Mac recovers"
+            nxt = "Wait for the running agents to finish, or quit the biggest app named in the text."
+            text = head + "Using the most: " + who + ". Our agents are part of the load; pausing stops new ones."
+        else:
+            text = head + f"Using the most: {who}. Biggest apps: {app_txt()}. Nothing of ours to stop; quit the big apps if you do not need them." if apps else text
+        self.host["cause"] = cause
+        self.add("host_busy", sev, lead, title, text, mode=mode, chain=chain, fix_label=fix_label, nxt=nxt, extra={"top": [{"who": o, **b} for o, b in top], "cause": cause})
+
+    def judge_vm(self, live):
+        c = self.c; chat_pids = {p["pid"] for p in live}
+        for p in self.procs.values():
+            if p["pid"] in chat_pids or INFRA.search(p["cmd"]) or p["pid"] not in self.vm_pids or p["pid"] in self.vm_claimed:
+                continue                                                       # one row per real-world cause: a Mac-busy row that already offers to stop this VM replaces vm_idle
+            if p["age"] >= c["vm_hours"] * 3600 and p["rss"] > 1024:
+                ok, rows = self.docker_ps()
+                if ok and not rows:
+                    self.add("vm_idle", "amber", "", f"Docker VM idle, up {int(p['age'] // 86400)} d, {p['rss'] / 1024:.1f} GB", "No running containers; the VM keeps its memory.", pid=p["pid"], start=p["start"])
+
+    def judge_leftovers(self):
+        c, t = self.c, self.t
+        for p in self.procs.values():
+            if not ALLOW.search(p["cmd"]) or p["age"] < c["orphan_min"] * 60 or max(self.ws["cpu"].get(str(p["pid"]), [p["cpu"]])[-3:]) >= c["orphan_cpu"]:
+                continue
+            if p["ppid"] != 1 and p["ppid"] in self.procs:
+                continue                                                       # has a living parent: not an orphan
+            lin = self.lineage.get(str(p["pid"]))
+            if bool(lin) and abs(lin["start"] - p["start"]) <= 5 and not self.alive(lin["claude"], lin["claude_start"]):
+                p["proven_orphan"] = True                                      # the chat that started it is dead: ended automatically
+                if not self.auto_on:                                           # automatic cleanup is off: the proven orphan stays visible, with a Fix button
+                    self.add("leftover", "amber", lin.get("project", ""), f"leftover: {red(p['cmd'])[:50]}", "Its parent chat is dead and nothing else owns it. Automatic cleanup is off: press Fix to end it.", pid=p["pid"], start=p["start"])
+                elif self.dry:
+                    self.add("orphan", "amber", lin.get("project", ""), f"leftover: {red(p['cmd'])[:50]}", "Its parent chat is dead; the watcher ends it by itself.", pid=p["pid"], start=p["start"])
+            else:
+                p["leftover"] = True                                           # no proof: listed in host.unowned, never raised
+
+    def collect_unowned(self):
+        """Heavy or leftover processes that belong to no project and are not provably ours: shown in the Mac-busy detail, never raised, never touched."""
+        c = self.c; hist = self.ws.setdefault("cpu", {}); out = []
+        chat_pids = {p["pid"] for p in self.procs.values() if p.get("chat")}
+        for p in self.procs.values():
+            if p["pid"] in chat_pids or (INFRA.search(p["cmd"]) and "playwright" not in p["cmd"]) or p["pid"] in self.vm_pids or HOSTAGENT_RE.search(p["cmd"]) or self.owner_of(p) or p.get("proven_orphan"):
+                continue
+            h = hist.get(str(p["pid"]), [])
+            hot = len(h) >= c["hog_scans"] and min(h[-c["hog_scans"]:]) > c["hog_cpu"]
+            why = "heavy memory" if p["rss"] > c["hog_gb"] * 1024 else "high CPU for a long time" if hot else "possible leftover: parent gone, nothing proves who started it" if p.get("leftover") else ""
+            if why:
+                out.append({"app": app_name(p["cmd"], False), "gb": round(p["rss"] / 1024, 1), "pid": p["pid"], "why": why})
+        self.unowned = sorted(out, key=lambda x: -x["gb"])
+
+    # --- automatic, provably safe cleanup ---
+    def housekeeping(self):
+        c, t = self.c, self.t
+        self.ws["hk_last"] = int(t)
+        for p in list(self.procs.values()):
+            if p.get("proven_orphan"):
+                self.kill(p, "orphan")
+        for proj in self.projs:                                                # records so old that nothing can be running (the dead-record proof runs on every scan)
+            f = STATE / f"{proj}.agents.json"
+            if not isinstance(jread(f, {}), dict) or not jread(f, {}):
+                continue
+            tr = transcripts(proj)
+            with AgentsLock(proj):
+                ag = jread(f, {}); keep = {}
+                if not isinstance(ag, dict):
+                    continue
+                for aid, a in ag.items():
+                    fw = tr["agents"].get(aid) if tr else None
+                    old = isinstance(a, dict) and (a.get("started") or 0) > 0 and t - a.get("started", t) >= c["stale_agent_h"] * 3600 and (fw is None or t - fw >= c["stale_quiet_min"] * 60)
+                    if old:
+                        self.cleaned.append({"ts": int(t), "what": "stale agent record", "pid": 0, "cmd": f"{proj}: {a.get('type', 'agent')} (over {c['stale_agent_h']} h old and quiet)"}); log(f"dropped stale agent record {proj}/{a.get('type')}")
+                    else:
+                        keep[aid] = a
+                if keep != ag:
+                    jwrite(f, keep)
+        if t - self.ws.get("housekeeping_at", 0) >= c["housekeeping_every_min"] * 60:
+            self.ws["housekeeping_at"] = t; n = 0
+            try:
+                for f in TMP.rglob("*.output"):
+                    if t - f.stat().st_mtime > c["output_days"] * 86400 and n < 200:
+                        f.unlink(); n += 1
+            except Exception:
+                pass
+            if n:
+                self.cleaned.append({"ts": int(t), "what": "old task outputs", "pid": 0, "cmd": f"{n} files older than {c['output_days']} days"}); log(f"deleted {n} old task outputs")
+            nflow = 0                                                          # team-flow session state, its lock and temp files: older than 14 days
+            for pat in ("flow.*.json", "flow.*.json.lock", "flow.*.json.*.tmp", "flow.*.quiet"):
+                for f in list(STATE.glob(pat)):
+                    try:
+                        if t - f.stat().st_mtime > 14 * 86400:
+                            f.unlink(); nflow += 1
+                    except OSError:
+                        pass
+            if nflow:
+                self.cleaned.append({"ts": int(t), "what": "old team-flow state files", "pid": 0, "cmd": f"{nflow} files older than 14 days"}); log(f"deleted {nflow} old team-flow state files")
+            keepnames = set(self.projs) | STATE_KEEP
+            for f in list(STATE.glob("*.json")):
+                n2 = re.sub(r"\.(agents|model|mode|limit)?\.?json$", "", f.name)
+                if n2 and n2 not in keepnames and not n2.startswith(("post-gate", "plan-", "handoff", "flow.", "project-", "health-")) and not (DEV / n2).exists():
+                    f.unlink(); self.cleaned.append({"ts": int(t), "what": "leaked state file", "pid": 0, "cmd": f.name}); log(f"removed leaked state file {f.name}")
+
+    # --- hysteresis + output ---
+    def finish(self, target=None):
+        c, t = self.c, self.t
+        seen, clear, vis = self.ws.setdefault("seen", {}), self.ws.setdefault("clear", {}), self.ws.setdefault("visible", {})
+        raw = {i["id"]: i for i in self.items}
+        immediate = lambda i: i["mode"] in ("info", "wait", "auto")
+        if self.verify:                                                        # no hysteresis counters; the checked item leaves the list at once
+            for iid, i in raw.items():
+                if immediate(i):
+                    vis.setdefault(iid, int(t))
+            if target and target not in raw:
+                for d in (vis, seen, clear):
+                    d.pop(target, None)
+                fx = self.ws.setdefault("fixed", {}); fx[target] = int(t)
+                for k in [k for k, v in fx.items() if t - v > 86400]:
+                    del fx[k]
+        else:
+            for iid in raw:
+                seen[iid] = seen.get(iid, 0) + 1; clear[iid] = 0
+                if seen[iid] >= 2 or immediate(raw[iid]):
+                    vis.setdefault(iid, int(t))
+            for iid in list(vis):
+                if iid not in raw:
+                    clear[iid] = clear.get(iid, 0) + 1
+                    if clear[iid] >= 2:
+                        vis.pop(iid, None); seen.pop(iid, None); clear.pop(iid, None)
+            for iid in [k for k in seen if k not in raw and k not in vis]:
+                seen.pop(iid, None)
+        shown = [raw[i] for i in raw if i in vis]
+        sev = {"red": 0, "amber": 1, "info": 2}
+        shown.sort(key=lambda i: (sev[i["severity"]], i["project"], i["kind"]))
+        silenced = []                                                          # F7: items of set-aside projects (only the kinds of aside.SILENCED_KINDS) are listed, not raised
+        if shipmiracle_aside is not None:
+            try:
+                if not env("SHIPMIRACLE_NO_WRITE") and not self.dry:
+                    shipmiracle_aside.reconcile(self.chats, base=STATE)                 # an aside project that started work or hit a hard stop comes back first
+                shown, silenced = shipmiracle_aside.split_items(shown, base=STATE)
+            except Exception:
+                silenced = []
+        today = [x for x in (jread(STATE / "health.json", {}) or {}).get("cleaned", []) if t - x["ts"] < 86400] + self.cleaned
+        wf = self.work_frozen; working = [p for p, (w, fz) in wf.items() if w]
+        all_frozen = bool(working) and all(wf[p][1] for p in working)
+        since = (self.ws.get("frozen_since") or t) if all_frozen else None
+        self.ws["frozen_since"] = since
+        needs = [i for i in shown if i["mode"] in ("fix", "auto") and i["severity"] in ("red", "amber")]
+        health = {"ts": int(t), "host": self.host, "chats": self.chats, "auto": bool(self.c["auto"]) and not (STATE / "auto-clean.off").exists(), "hk_last": self.ws.get("hk_last", 0), "items": shown, "aside_items": silenced, "cleaned": today[-30:],
+                  "counts": {"red": sum(1 for i in needs if i["severity"] == "red"), "amber": sum(1 for i in needs if i["severity"] == "amber")},
+                  "all_work_frozen_since": int(since) if since else None, "dry": self.dry}
+        for k in [k for k, v in self.lineage.items() if t - v.get("seen", 0) > 3 * 86400]:
+            del self.lineage[k]
+        for v in self.lineage.values():
+            if isinstance(v, dict) and "cmd" in v:
+                v["cmd"] = red(v["cmd"])[:120]
+        if len(self.lineage) > 5000:                                           # keep the newest 5000 entries
+            for k in sorted(self.lineage, key=lambda k: self.lineage[k].get("seen", 0))[:len(self.lineage) - 5000]:
+                del self.lineage[k]
+        if not env("SHIPMIRACLE_NO_WRITE"):
+            jwrite(STATE / "health.json", health, 0o600)
+            if shipmiracle_state:
+                try:
+                    shipmiracle_state.mirror("health.json", health, "shipmiracle-watch", base=STATE)
+                except Exception:       # a partly broken Shipmiracle package must never break the scan
+                    pass
+            jwrite(STATE / "lineage.json", self.lineage, 0o600); jwrite(STATE / "watch-state.json", self.ws, 0o600)
+        self.health = health
+
+
+# ---------- locks ----------
+class AgentsLock:
+    """flock on <project>.agents.json.lock around the watcher's read-modify-write of the agent records (the SubagentStart hook writes the same file)."""
+    def __init__(self, proj):
+        self.proj = proj
+
+    def __enter__(self):
+        STATE.mkdir(parents=True, exist_ok=True)
+        self.fh = open(STATE / f"{self.proj}.agents.json.lock", "a"); end = time.time() + 5
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB); return self
+            except OSError:
+                if time.time() >= end:
+                    return self                                              # never block the scan on a hook; the write is still atomic
+                time.sleep(0.05)
+
+    def __exit__(self, *a):
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+
+
+# ---------- the scan lock: guard, extension and CLI scans take turns ----------
+class Lock:
+    def __init__(self, wait=25):
+        self.wait = float(env("SHIPMIRACLE_LOCK_WAIT") or wait)
+
+    def __enter__(self):
+        STATE.mkdir(parents=True, exist_ok=True)
+        self.fh = open(STATE / "watch.lock", "a"); end = time.time() + self.wait
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB); return self
+            except OSError:
+                if time.time() >= end:
+                    self.fh.close(); raise TimeoutError("another shipm-watch scan is running")
+                time.sleep(0.2)
+
+    def __exit__(self, *a):
+        try:
+            fcntl.flock(self.fh, fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+
+
+# ---------- owner actions ----------
+PROJECT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+CP_WARN = []
+
+
+class CpFail(Exception):
+    pass
+
+
+def secret_name(path):
+    """New (untracked) files that look like secrets never go into the wip tree."""
+    base = path.lower().rsplit("/", 1)[-1]
+    return (base.startswith(".env") or (base.startswith("id_") and not base.endswith(".pub"))
+            or base.endswith((".pem", ".key", ".p12", ".pfx", ".p8", ".jks", ".keystore", ".mobileprovision"))
+            or base in (".netrc", ".npmrc", ".pypirc") or any(w in base for w in ("credentials", "secret", "token"))
+            or bool(re.match(r"^service-account.*\.json$", base)))
+
+
+def checkpoint(project):
+    """Save uncommitted work to wip/frozen-<date> with git plumbing: the working tree, HEAD and the current branch are not touched.
+    Returns the branch name, 'nothing to save', or 'failed: <step>'. A failed push is only a warning (CP_WARN)."""
+    del CP_WARN[:]
+    if not PROJECT_RE.match(project or "") or project not in projects():
+        return "failed: unknown project"
+    d = DEV / project
+    if not os.access(GIT, os.X_OK):
+        return "failed: git not found"
+    idx = d / ".git" / f"shipmiracle-index-{os.getpid()}"
+    genv = dict(os.environ, GIT_INDEX_FILE=str(idx))
+
+    def g(*a, e=None):
+        return subprocess.run([GIT, "-C", str(d), *a], capture_output=True, text=True, env=e, timeout=60)
+
+    def must(step, *a, e=None):
+        try:
+            r = g(*a, e=e)
+        except Exception:
+            raise CpFail(step)
+        if r.returncode != 0:
+            raise CpFail(step)
+        return r.stdout
+
+    try:
+        try:
+            head = must("no commit yet (unborn or broken repository)", "rev-parse", "--verify", "-q", "HEAD^{commit}").strip()
+        except CpFail as e:
+            return f"failed: {e}"
+        if not g("config", "user.name").stdout.strip():
+            genv.update(GIT_AUTHOR_NAME="shipmiracle-watch", GIT_AUTHOR_EMAIL="shipmiracle-watch@localhost", GIT_COMMITTER_NAME="shipmiracle-watch", GIT_COMMITTER_EMAIL="shipmiracle-watch@localhost")
+        must("read-tree", "read-tree", "HEAD", e=genv); must("add", "add", "-A", e=genv)
+        tracked = set(must("ls-tree", "ls-tree", "-r", "-z", "--name-only", "HEAD").split("\0"))
+        for f in must("ls-files", "ls-files", "-z", e=genv).split("\0"):
+            if f and ((f not in tracked and secret_name(f)) or ((d / f).exists() and (d / f).stat().st_size > 5_000_000)):
+                must("rm --cached", "rm", "--cached", "-q", "--ignore-unmatch", "--", f, e=genv)
+        tree = must("write-tree", "write-tree", e=genv).strip()
+        if must("rev-parse tree", "rev-parse", "HEAD^{tree}").strip() == tree:
+            return "nothing to save"
+        commit = must("commit-tree", "commit-tree", tree, "-p", head, "-m", "frozen-work checkpoint (automatic, shipm-watch)", e=genv).strip()
+        br = "wip/frozen-" + time.strftime("%Y-%m-%d-%H%M%S", time.localtime(now()))
+        must("update-ref", "update-ref", f"refs/heads/{br}", commit)
+        if must("verify branch", "rev-parse", f"refs/heads/{br}").strip() != commit:
+            raise CpFail("verify branch")
+        try:
+            if g("push", "-q", "origin", f"refs/heads/{br}").returncode != 0:
+                CP_WARN.append("push to origin failed; the checkpoint exists only on this Mac")
+        except Exception:
+            CP_WARN.append("push to origin failed; the checkpoint exists only on this Mac")
+        return br
+    except CpFail as e:
+        return f"failed: {e}"
+    finally:
+        idx.unlink(missing_ok=True)
+
+
+def emit(ok, did="", why=""):
+    print(json.dumps({"ok": bool(ok), "did": did, "why": why})); return 0 if ok else 2
+
+
+def fresh_scan():
+    """A raw scan for can / act: current facts, no writes, no hysteresis, no side effects."""
+    s = Scan(dry=True, verify=True); s.observe(); return s
+
+
+def check_item(op, ident):
+    """(ok, why, item_now, scan, item_before): is `op` allowed on item `ident` right now? Everything that decides comes from a FRESH scan: the item must
+    still be raised, with this op among its actions and the same kind. health.json (which could be planted) is only used to prove that a pid is still the
+    same process (start time within 5 s of what the owner saw)."""
+    h = jread(STATE / "health.json", {}) or {}
+    prev = next((i for i in h.get("items", []) if isinstance(i, dict) and i.get("id") == ident), None)
+    if not prev or op not in OPS:
+        return False, "not a current action", None, None, prev
+    s = fresh_scan()
+    cur = next((i for i in s.items if i["id"] == ident), None)
+    if not cur:
+        return False, "that process is gone or changed; nothing done" if prev.get("pid") else "that item is gone: it is no longer raised; nothing done", None, s, prev
+    if cur["kind"] != prev.get("kind") or op not in cur["actions"]:
+        return False, "not a current action", cur, s, prev
+    if cur["pid"] and abs(cur["start"] - (prev.get("start") or 0)) > 5:
+        return False, "that process is gone or changed; nothing done", cur, s, prev
+    ok, why = OPS[op]["applicable"](cur, s)
+    return ok, why, cur, s, prev
+
+
+def act(op, ident):
+    if op == "checkpoint":
+        r = checkpoint(ident); print(r)
+        for w in CP_WARN:
+            print("warning: " + w, file=sys.stderr); log("checkpoint " + w)
+        return 2 if r.startswith("failed") else 0
+    if op in ("auto-clean-on", "auto-clean-off"):                              # the owner's switch for all automatic cleanup (a file, so it survives restarts)
+        f = STATE / "auto-clean.off"; STATE.mkdir(parents=True, exist_ok=True)
+        f.unlink(missing_ok=True) if op == "auto-clean-on" else f.touch(); return emit(True, "automatic cleanup " + ("on" if op == "auto-clean-on" else "off"))
+    if op in ("pause-agents", "resume-agents") and ident in ("", "-", "host"):
+        f = STATE / "agents.paused"
+        f.touch() if op == "pause-agents" else f.unlink(missing_ok=True); return emit(True, "paused" if op == "pause-agents" else "resumed")
+    try:
+        lock = Lock(20).__enter__()
+    except TimeoutError as e:
+        return emit(False, "", str(e))
+    try:                                                                       # the lock covers the checking only; checkpoint, kill and colima stop run outside it
+        ok, why, item, s, prev = check_item(op, ident)
+    finally:
+        lock.__exit__()
+    if not ok:
+        return emit(False, "", why)
+    if OPS[op]["executor"] != "watch":
+        return emit(False, "", "this step runs inside VS Code, not in the watcher")
+    if op in ("end-job", "end-proc", "quit-session", "close-duplicate"):
+        p = s.procs[item["pid"]]
+        if item["project"] and op != "end-proc":
+            r = checkpoint(item["project"])
+            if not (r == "nothing to save" or r.startswith("wip/")):
+                return emit(False, "", f"could not save your work first ({r}); nothing ended")
+        if not s.kill(p, op):
+            return emit(False, "", "the process changed before it could be ended (pid reuse); nothing ended")
+        return emit(True, f"ended pid {p['pid']}")
+    if op == "end-browser":
+        p = s.procs[item["pid"]]
+        kids = [d for d in descendants(s.procs, p["pid"]) if not udd_of(d["cmd"]) or temp_profile(d["cmd"])]
+        if not s.kill(p, op):
+            return emit(False, "", "the process changed before it could be ended (pid reuse); nothing ended")
+        left = []
+        for d in kids:
+            if not env("SHIPMIRACLE_KILL_LOG"):
+                time.sleep(0.2)
+                cur = read_ps().get(d["pid"])
+                if not cur or abs(cur["start"] - d["start"]) > 5:
+                    continue
+            s.kill(d, op)
+        if not env("SHIPMIRACLE_KILL_LOG"):
+            now_ps = read_ps()
+            left = [d["pid"] for d in [p] + kids if d["pid"] in now_ps and abs(now_ps[d["pid"]]["start"] - d["start"]) <= 5]
+        return emit(not left, f"ended the browser pid {p['pid']} and {len(kids)} helper process(es)" if not left else "", f"still running after the step: {left}" if left else "")
+    if op == "end-testrun":
+        p = s.procs[item["pid"]]
+        kids = descendants(s.procs, p["pid"])
+        if env("SHIPMIRACLE_KILL_LOG"):
+            with open(env("SHIPMIRACLE_KILL_LOG"), "a") as f:
+                f.write(f"{p['pid']} {op}\n")
+            return emit(True, f"sent SIGTERM to test-all pid {p['pid']}")
+        cur = read_ps().get(p["pid"])
+        if not cur or abs(cur["start"] - p["start"]) > 5 or not is_testrun(cur):
+            return emit(False, "", "the process changed before it could be stopped (pid reuse); nothing done")
+        try:
+            os.kill(p["pid"], signal.SIGTERM)                                    # SIGTERM only: test-all's handler stops its own suites and cleans up; never forced
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            return emit(False, "", f"could not send SIGTERM: {e}")
+        for _ in range(40):
+            time.sleep(0.5)
+            c2 = read_ps().get(p["pid"])
+            if not c2 or abs(c2["start"] - p["start"]) > 5:
+                break
+        now_ps = read_ps()
+        gone = not (p["pid"] in now_ps and abs(now_ps[p["pid"]]["start"] - p["start"]) <= 5)
+        left = [f"{d['pid']} ({red(d['cmd'])[:50]})" for d in kids if d["pid"] in now_ps and abs(now_ps[d["pid"]]["start"] - d["start"]) <= 5]
+        if not gone:
+            return emit(False, "", f"test-all pid {p['pid']} is still running after SIGTERM; it was not forced")
+        return emit(True, f"stopped test-all pid {p['pid']}" + (f"; leftover child process(es) still running: {', '.join(left)}" if left else "; no child process left"))
+    if op == "stop-colima":
+        f = env("SHIPMIRACLE_COLIMA")
+        if f:
+            pathlib.Path(f).write_text("stopped"); return emit(True, "stopped")
+        rc, out = sh([tool("colima"), "stop"], 90, tool_env())
+        return emit(rc == 0, "stopped the Docker VM" if rc == 0 else "", "" if rc == 0 else red(out.strip()[-200:]))
+    if op == "pause-agents":
+        (STATE / "agents.paused").touch(); return emit(True, "paused new agents")
+    if op == "drop-record":
+        s.dry = False; s.drop_dead(only=(item["project"], item.get("agent", ""))); return emit(True, f"dropped the record of {item.get('agent', '')}")
+    return emit(False, "", "unknown action")
+
+
+def cmd_can(op, ident):
+    blank = {"ok": False, "why": "", "project": "", "kind": "", "working": False}
+    try:
+        lock = Lock(20).__enter__()
+    except TimeoutError as e:
+        print(json.dumps(dict(blank, why="could not check: " + str(e)))); return 2
+    try:
+        ok, why, item, s, prev = check_item(op, ident)
+    finally:
+        lock.__exit__()
+    proj = (item or prev or {}).get("project", "")
+    print(json.dumps({"ok": bool(ok), "why": why, "project": proj, "kind": (item or prev or {}).get("kind", ""), "working": bool(s and s.working_now.get(proj, False))})); return 0 if ok else 2
+
+
+def cmd_verify(ident):
+    unchecked = {"gone": False, "detail": "could not check: another scan holds the lock", "checked": False, "item": None, "chat_state": "", "working": False, "interrupted_at": 0, "lead_mtime": 0}
+    try:
+        lock = Lock(25).__enter__()
+    except TimeoutError:
+        print(json.dumps(unchecked)); return 0
+    try:
+        prev = next((i for i in (jread(STATE / "health.json", {}) or {}).get("items", []) if isinstance(i, dict) and i.get("id") == ident), None)
+        s = Scan(verify=True); s.observe()
+        if s.auto_on:
+            s.drop_dead()
+            for p in list(s.procs.values()):
+                if p.get("proven_orphan"):
+                    s.kill(p, "orphan")
+        now_item = next((i for i in s.items if i["id"] == ident), None)
+        proj = (prev or now_item or {}).get("project", ""); ch = s.chats.get(proj, {})
+        detail = None
+        if now_item and prev and now_item["pid"] and abs(now_item["start"] - (prev.get("start") or 0)) > 5:
+            detail = "the process was replaced by another one (the old one is gone)"           # the pid was reused: the thing we watched is gone
+        elif now_item and prev and prev.get("chain") == ["pause-agents"] and now_item["kind"] == "host_busy" and now_item["mode"] in ("info", "wait"):
+            detail = "reclassified as information: " + now_item["why"]                          # the one allowed reclassification: agents are paused now
+        elif now_item and prev and now_item["kind"] in ("context_full", "session_large") and prev.get("chat_start"):
+            newer = [q["start"] for q in s.live_by_proj.get(proj, []) if q["start"] > prev["chat_start"] + 10]
+            if newer and ch.get("lead_mtime", 0) < min(newer):
+                detail = "a newer chat was started and the old conversation is no longer written"
+        gone = now_item is None or detail is not None
+        s.finish(ident if gone else None)
+        print(json.dumps({"gone": gone, "detail": detail or ("gone" if now_item is None else now_item["why"]), "checked": True, "item": None if gone else now_item,
+                          "chat_state": ch.get("state", ""), "working": bool(s.working_now.get(proj, False)), "interrupted_at": ch.get("interrupted_at", 0), "lead_mtime": ch.get("lead_mtime", 0)}))
+    finally:
+        lock.__exit__()
+    return 0
+
+
+def contract():
+    return {"kinds": {k: {"mode": v["mode"], "chain": list(v["chain"]), "sev": v["sev"], "fix_label": v["fix_label"], "proof": v["proof"], "info": v["info"], "next": v["next"]} for k, v in KINDS.items()},
+            "ops": {k: {"executor": v["executor"], "wait_s": v["wait_s"], "checks": v["checks"], "destructive": v["destructive"]} for k, v in OPS.items()}}
+
+
+def scan(dry=False):
+    """One scan under the scan lock (library entry used by `shipm-watch scan` and by the guard's in-process job). Returns the summary
+    dict that the CLI prints, or {"skipped": ...} when another scan holds the lock. Prints nothing."""
+    try:
+        with Lock(25):
+            s = Scan(dry=dry); s.run(); h = s.health
+    except TimeoutError:
+        return {"skipped": "another scan is running"}
+    return {"red": h["counts"]["red"], "amber": h["counts"]["amber"], "cleaned": len(s.cleaned), "items": len(h["items"]),
+            "auto": [i["title"] for i in h["items"] if i["mode"] == "auto"]}
+
+
+def main(argv=None):
+    a = sys.argv[1:] if argv is None else list(argv)
+    if not a:
+        return print(__doc__)
+    if a[0] == "scan":
+        print(json.dumps(scan("--dry" in a)))
+    elif a[0] == "status":
+        h = jread(STATE / "health.json", {})
+        if not h:
+            return print("no scan yet")
+        print(f"host: swap {h['host'].get('swap_pct')} %, free {h['host'].get('free_pct')} %, load {h['host'].get('load')}{'  BUSY' if h['host'].get('busy') else ''}")
+        for i in h["items"]:
+            print(f"  [{i['severity']:5}] [{i.get('mode', ''):4}] {i['project'] or '-':24} {i['title']}  ({i['why'][:70]})")
+        for u in h["host"].get("unowned", []):
+            print(f"  unowned: {u['app']} {u['gb']} GB pid {u['pid']} ({u['why']})")
+        print(f"  cleaned in the last day: {len(h['cleaned'])}")
+    elif a[0] == "host":
+        c, h = cfg(), host_readings()
+        unk = [k for k in h.get("unknown", []) if k in ("load", "swap_pct", "cores")]
+        if unk:      # never say "ok" about a machine that could not be read (exit 1 = do not start a heavy job)
+            print("unknown: could not read " + ", ".join(unk) + " on this system; not safe to call it quiet"); sys.exit(1)
+        why = []
+        if h["swap_pct"] >= 70: why.append(f"swap {int(h['swap_pct'])} %")
+        if h["load"] >= 1.5 * h["cores"]: why.append(f"load {h['load']:.1f} on {h['cores']} cores")
+        print("busy: " + ", ".join(why) if why else "ok"); sys.exit(1 if why else 0)
+    elif a[0] == "act" and len(a) >= 2:
+        sys.exit(act(a[1], a[2] if len(a) > 2 else ""))
+    elif a[0] == "can" and len(a) >= 3:
+        sys.exit(cmd_can(a[1], a[2]))
+    elif a[0] == "verify" and len(a) >= 2:                                      # `--since TS` is accepted and ignored: the extension compares interrupted_at itself
+        sys.exit(cmd_verify(a[1]))
+    elif a[0] == "contract":
+        print(json.dumps(contract()))
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

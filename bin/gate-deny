@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""gate-deny: native Claude Code deny rules that protect the team-flow gate files.
+  gate-deny install [--settings PATH]   append the missing rules to permissions.deny
+  gate-deny check   [--settings PATH]   print missing rules; exit 1 if any
+  gate-deny remove  [--settings PATH]   delete exactly these rules
+  --auto (install/check, used by shipm sync, daily, doctor): do nothing and exit 0 when the opt-out file
+  config/gate-deny.off exists (env SHIPMIRACLE_GATE_DENY_OFF overrides its path), so a deliberate remove stays removed.
+Default settings file: ~/.claude/settings.json. Exit 2 on a malformed or non-object file (nothing written).
+Stdlib only."""
+import json, os, sys, tempfile
+
+def _dirs():
+    """(engine folder, projects folder) as deny-rule path prefixes. Config engine.dir / paths.projects_dir win; else the main checkout of the
+    folder this script lives in (so a git worktree still protects the real engine) and ~/Developer. Under the home folder a path is written ~/..."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    eng, proj = root, "~/Developer"
+    try:
+        sys.path.insert(0, root)
+        from shipmiracle import config, paths
+        eng = config.get("engine.dir", None) or str(paths.main_checkout(root))
+        proj = config.get("paths.projects_dir", None) or proj
+    except Exception:
+        pass
+    finally:
+        if sys.path and sys.path[0] == root:
+            sys.path.pop(0)
+    home = os.path.expanduser("~").rstrip("/")
+
+    def tilde(p):
+        p = os.path.normpath(os.path.expanduser(p))
+        return "~" + p[len(home):] if home and (p == home or p.startswith(home + "/")) else p
+    return tilde(eng), tilde(proj)
+
+
+ENGINE, PROJECTS = _dirs()
+RULES = [
+    "Edit(~/.claude/settings.json)",
+    "Edit(~/.claude/settings.local.json)",
+    "Edit(%s/hooks/**)" % ENGINE,
+    "Edit(%s/config/flow.json)" % ENGINE,
+    "Edit(%s/config/gate-deny.off)" % ENGINE,
+    "Edit(%s/bin/gate-deny)" % ENGINE,
+    "Edit(%s/bin/shipm-chat)" % ENGINE,
+    "Edit(%s/*/.claude/settings.json)" % PROJECTS,
+    "Edit(%s/*/.claude/settings.local.json)" % PROJECTS,
+    "Edit(%s/*/.claude/hooks/**)" % PROJECTS,
+    "Edit(~/.local/state/shipmiracle/*)",
+    # Phase 3b: the user-level team, the registry/config folder, the Shipmiracle engine and the v1 state folder (the rule above is one level only)
+    "Edit(~/.claude/agents/**)",
+    "Edit(~/.config/shipmiracle/**)",
+    "Edit(%s/shipmiracle/**)" % ENGINE,
+    "Edit(~/.local/state/shipmiracle/v1/**)",
+    # Phase 5 T4: the playbook and its rendered record in every project (owner-written / engine-written only)
+    "Edit(%s/*/.shipmiracle/**)" % PROJECTS,
+    "Edit(**/.shipmiracle/**)",
+    # the engine link folder (gate_dirs lists it; a hook command may run through it): the Edit tool must not rewrite what the links point to
+    "Edit(~/.local/share/shipmiracle/**)",
+]
+# First-generation narrower state rules: install removes them (the single state rule covers them), remove deletes them too.
+OLD_RULES = [
+    "Edit(~/.local/state/shipmiracle/*.json)",
+    "Edit(~/.local/state/shipmiracle/*.jsonl)",
+    "Edit(~/.local/state/shipmiracle/*.lock)",
+    "Edit(~/.local/state/shipmiracle/plan-pending.*)",
+]
+_TEST_HOOK = None   # tests: called between the read and the final stat check
+
+
+def load(path):
+    """Return the settings dict ({} when the file is missing); exit 2 when unusable."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            txt = f.read()
+        d = json.loads(txt) if txt.strip() else None
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"gate-deny: cannot read {path}: {e}\n")
+        sys.exit(2)
+    if not isinstance(d, dict):
+        sys.stderr.write(f"gate-deny: {path} is not a JSON object; nothing written\n")
+        sys.exit(2)
+    return d
+
+
+def deny_list(d, create):
+    p = d.get("permissions")
+    if p is None:
+        if not create:
+            return []
+        p = d["permissions"] = {}
+    if not isinstance(p, dict):
+        sys.stderr.write("gate-deny: permissions is not an object; nothing written\n")
+        sys.exit(2)
+    dl = p.get("deny")
+    if dl is None:
+        if not create:
+            return []
+        dl = p["deny"] = []
+    if not isinstance(dl, list):
+        sys.stderr.write("gate-deny: permissions.deny is not a list; nothing written\n")
+        sys.exit(2)
+    return dl
+
+
+def sig_of(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def write_atomic(path, d, sig):
+    """Write next to the real file (a symlinked settings.json stays a symlink).
+    Return False when the file changed since it was read (caller retries)."""
+    real = os.path.realpath(path)
+    folder = os.path.dirname(real)
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".gate-deny.", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+        if os.path.exists(real):
+            os.chmod(tmp, os.stat(real).st_mode & 0o777)
+        if sig_of(real) != sig:
+            os.unlink(tmp)
+            return False
+        os.replace(tmp, real)
+        return True
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def change(path, cmd):
+    """Read-merge-write for install/remove, retried up to 3 times if the file changes underneath."""
+    real = os.path.realpath(path)
+    for _ in range(3):
+        sig = sig_of(real)
+        d = load(real)
+        dl = deny_list(d, cmd == "install")
+        if cmd == "install":
+            drop = [r for r in dl if r in OLD_RULES]
+            added = [r for r in RULES if r not in dl]
+            new = [r for r in dl if r not in OLD_RULES] + added
+            if not drop and not added:
+                return [], []
+            dl[:] = new
+        else:
+            added = []
+            drop = [r for r in dl if r in RULES or r in OLD_RULES]
+            if not drop:
+                return [], []
+            dl[:] = [r for r in dl if r not in drop]
+        if _TEST_HOOK:
+            _TEST_HOOK()
+        if write_atomic(real, d, sig):
+            return added, drop
+    sys.stderr.write("gate-deny: %s kept changing while writing; nothing written\n" % path)
+    sys.exit(2)
+
+
+def main(argv):
+    if not argv or argv[0] not in ("install", "check", "remove"):
+        sys.stderr.write(__doc__ + "\n")
+        return 2
+    cmd, rest = argv[0], argv[1:]
+    path = os.path.expanduser("~/.claude/settings.json")
+    auto = "--auto" in rest
+    rest = [a for a in rest if a != "--auto"]
+    if rest:
+        if len(rest) == 2 and rest[0] == "--settings":
+            path = os.path.expanduser(rest[1])
+        else:
+            sys.stderr.write(__doc__ + "\n")
+            return 2
+    if auto and cmd in ("install", "check"):
+        off = os.environ.get("SHIPMIRACLE_GATE_DENY_OFF") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "config", "gate-deny.off")
+        if os.path.exists(off):
+            print("deny rules switched off by config/gate-deny.off")
+            return 0
+    d = load(path)
+    if cmd == "check":
+        have = deny_list(d, False)
+        missing = [r for r in RULES if r not in have]
+        for r in missing:
+            print("missing:", r)
+        if not missing:
+            print("all %d deny rules present" % len(RULES))
+        return 1 if missing else 0
+    added, drop = change(path, cmd)
+    if cmd == "install":
+        for r in drop:
+            print("  removed old rule", r)
+        for r in added:
+            print("  added", r)
+        if not added and not drop:
+            print("  deny rules already present")
+    else:
+        for r in drop:
+            print("  removed", r)
+        if not drop:
+            print("  none of the rules present")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

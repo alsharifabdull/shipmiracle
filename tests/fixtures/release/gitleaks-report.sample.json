@@ -1,0 +1,14 @@
+[
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key",
+  "StartLine": 3,
+  "EndLine": 3,
+  "StartColumn": 5,
+  "EndColumn": 40,
+  "Match": "REDACTED",
+  "Secret": "REDACTED",
+  "File": "@TREE@/src/app.txt",
+  "Fingerprint": "src/app.txt:generic-api-key:3"
+ }
+]

@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""idea — a per-project checklist of feature ideas (the Shipmiracle "Ideas" tab): docs/FEATURE-IDEAS.md (committed, so it travels with the project).
+
+  idea [-p PROJECT] add "idea text" [#tag ...]     append to Open (id = highest B-number + 1), commit just that file
+  idea [-p PROJECT] list [--all|--evaluated|--done] [--json]
+  idea [-p PROJECT] done F3 | drop F3              move to Done / Dropped with today's date
+  idea [-p PROJECT] verdict F3 "BUILD LATER · score 2.4 · reason"   move to Evaluated, add the ↳ verdict line
+  idea [-p PROJECT] move F3 --to PROJECT              re-home an idea (Inbox = the `ideas` project)
+  idea [-p PROJECT] copy F3 --to PROJECT              copy an idea to another project (the original stays)
+  idea [-p PROJECT] eval-prompt F3 [F5 ...]        the one-line prompt that starts a review in that project's chat
+  idea index                                       every open idea in every project and in `ideas`, with likely overlaps
+  idea nudge [--dry]                               (shipm-guard, every 10 min) ask the owner once about ideas in idle projects
+  idea snooze PROJECT | never PROJECT | dismiss    answers to that ask (panel buttons)
+
+PROJECT defaults to the git folder you are in (or CLAUDE_PROJECT_DIR). A project on config/ci-hold.txt is refused (its session is still running).
+Line format (one line per item so git merges cleanly):  - [ ] F7 · 2026-10-19 · text #tag
+Evaluated items carry one more line:                      ↳ verdict: BUILD LATER · score 2.4 · reason
+Env for tests: SHIPMIRACLE_DEV SHIPMIRACLE_STATE SHIPMIRACLE_HOME SHIPMIRACLE_WS SHIPMIRACLE_TEST (no notifications)."""
+import json, os, pathlib, re, subprocess, sys, time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))     # the real location of this script, also when run through a symlink
+from shipmiracle import ShipmiracleError, projects as shipmiracle_projects  # noqa: E402
+try:
+    from shipmiracle import config as shipmiracle_config  # noqa: E402
+except Exception:      # the engine is unusable: the default projects folder below
+    shipmiracle_config = None
+
+HOME = pathlib.Path(os.environ.get("SHIPMIRACLE_HOME", pathlib.Path.home()))
+WS = pathlib.Path(os.environ.get("SHIPMIRACLE_WS", pathlib.Path(__file__).resolve().parent.parent))
+
+
+def _projects_dir():
+    """SHIPMIRACLE_DEV (tests), else config paths.projects_dir (absolute, or ~/... against HOME), else ~/Developer."""
+    if os.environ.get("SHIPMIRACLE_DEV"):
+        return pathlib.Path(os.environ["SHIPMIRACLE_DEV"])
+    try:
+        v = shipmiracle_config.get("paths.projects_dir", None) if shipmiracle_config else None
+    except Exception:
+        v = None
+    if isinstance(v, str) and v:
+        return HOME / v[2:] if v.startswith("~/") else pathlib.Path(v)
+    return HOME / "Developer"
+
+
+DEV = _projects_dir()
+STATE = pathlib.Path(os.environ.get("SHIPMIRACLE_STATE", HOME / ".local/state/shipmiracle"))
+TEST = bool(os.environ.get("SHIPMIRACLE_TEST"))
+SECTIONS = ["Open", "Evaluated", "Done / Dropped"]
+ITEM = re.compile(r"^- \[( |x|-)\] (?:(F\d+) · )?(?:(\d{4}-\d{2}-\d{2}) · )?(.*)$")
+HEADER = ("# Feature ideas — {name}\n\nFeature ideas for this project, one line each, so none is forgotten. Add one with\n"
+          "`shipm idea add \"idea\"` or tell the chat \"add to ideas: …\". To decide if an idea is worth building ask\n"
+          "\"is F3 worth it?\" (method: `docs/idea-review-method.md` in the Shipmiracle engine folder). Nothing here is built before a plan is approved.\n\n")
+
+
+def today():
+    return time.strftime("%Y-%m-%d")
+
+
+def jread(p, default=None):
+    try:
+        return json.loads(pathlib.Path(p).read_text())
+    except Exception:
+        return default
+
+
+def jwrite(p, obj):
+    p = pathlib.Path(p); p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name("." + p.name + ".tmp"); tmp.write_text(json.dumps(obj)); tmp.replace(p)
+
+
+def held():
+    try:
+        return [l.strip() for l in (WS / "config/ci-hold.txt").read_text().splitlines() if l.strip() and not l.startswith("#")]
+    except Exception:
+        return []
+
+
+def config():
+    c = {"idle_hours": 48, "ask_cooldown_hours": 24, "reask_days": 7, "owner_idle_s": 120}
+    c.update(jread(WS / "config/ideas.json", {}) or {})
+    return c
+
+
+def git(d, *a):
+    r = subprocess.run(["git", "-C", str(d), *a], capture_output=True, text=True)
+    return r.returncode, (r.stdout + r.stderr)
+
+
+# ---------- the file ----------
+class Ideas:
+    def __init__(self, name):
+        self.name, self.dir = name, DEV / name
+        self.path = self.dir / "docs/FEATURE-IDEAS.md"
+        self.items = []          # dicts: mark id date text section extra[list]
+        self.other = []          # lines we do not understand, kept as they are (section, line)
+        text = self.path.read_text() if self.path.exists() else ""
+        sec = "Open"
+        for line in text.splitlines():
+            m = re.match(r"^## (.*)$", line)
+            if m:
+                sec = m.group(1).strip() if m.group(1).strip() in SECTIONS else sec
+                continue
+            im = ITEM.match(line)
+            if im:
+                self.items.append({"mark": im.group(1), "id": im.group(2), "date": im.group(3) or today(), "text": im.group(4).strip(), "section": sec, "extra": []})
+            elif line.startswith("  ↳") and self.items:
+                self.items[-1]["extra"].append(line)
+            elif self.items == [] and not line.startswith("#"):
+                continue
+        self.fix_ids()
+
+    def fix_ids(self):
+        seen, top = set(), 0
+        for i in self.items:
+            if i["id"]:
+                top = max(top, int(i["id"][1:]))
+        for i in self.items:
+            if not i["id"] or i["id"] in seen:           # id-less (hand/phone) or duplicate (two sessions or tools added at the same time): number it now
+                top += 1; i["id"] = f"F{top}"
+            seen.add(i["id"])
+
+    def next_id(self):
+        return "F%d" % (max([int(i["id"][1:]) for i in self.items] + [0]) + 1)
+
+    def render(self):
+        out = [HEADER.format(name=self.name)]
+        for sec in SECTIONS:
+            out.append(f"## {sec}\n")
+            for i in [x for x in self.items if x["section"] == sec]:
+                out.append(f"- [{i['mark']}] {i['id']} · {i['date']} · {i['text']}")
+                out.extend(i["extra"])
+            out.append("")
+        return "\n".join(out).rstrip("\n") + "\n"
+
+    def find(self, bid):
+        bid = bid.upper()
+        for i in self.items:
+            if i["id"] == bid:
+                return i
+        sys.exit(f"{self.name}: no item {bid}")
+
+    def save(self, message):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(".FEATURE-IDEAS.md.tmp"); tmp.write_text(self.render()); tmp.replace(self.path)
+        if (self.dir / ".git").exists():                   # commit only this file: whatever the chat is half-way through stays untouched
+            git(self.dir, "add", "docs/FEATURE-IDEAS.md")
+            rc, out = git(self.dir, "commit", "-q", "-m", f"ideas: {message}", "--", "docs/FEATURE-IDEAS.md")
+            if rc != 0 and "nothing to commit" not in out:
+                print(f"saved, but the commit failed: {out.strip()[:160]}", file=sys.stderr)
+
+
+def project_name(args):
+    if "-p" in args:
+        i = args.index("-p"); n = args[i + 1]; del args[i:i + 2]; return n
+    here = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    rc, top = git(here, "rev-parse", "--show-toplevel")
+    return pathlib.Path(top.strip() if rc == 0 else here).name
+
+
+def project_exists(name):
+    """True when `name` is a listed project (shipmiracle.projects rule: direct child of DEV, not dot-named, .git exists); '../x', '', '.hidden' are not."""
+    try:
+        return shipmiracle_projects.get(name, dev=DEV) is not None
+    except ShipmiracleError as e:
+        sys.exit(f"shipm: {e}")
+
+
+def project_names():
+    return shipmiracle_projects.names(dev=DEV)
+
+
+def writable(name):
+    if not project_exists(name):
+        sys.exit(f"no project {name} in {DEV}")
+    if name in held():
+        sys.exit(f"{name} is on hold (its session is still running): add the idea later, or tell Claude to do it when the hold is released")
+
+
+# ---------- commands ----------
+def cmd_add(name, a):
+    writable(name)
+    tags = [x for x in a if x.startswith("#")]
+    text = " ".join(x for x in a if not x.startswith("#")).strip()
+    if not text:
+        sys.exit('usage: idea add "idea text" [#tag ...]')
+    b = Ideas(name); bid = b.next_id()
+    b.items.append({"mark": " ", "id": bid, "date": today(), "text": (text + " " + " ".join(tags)).strip(), "section": "Open", "extra": []})
+    b.save(f"add {bid}")
+    print(f"{name}: added {bid}")
+
+
+def cmd_list(name, a):
+    b = Ideas(name)
+    want = "Done / Dropped" if "--done" in a else "Evaluated" if "--evaluated" in a else None
+    rows = [i for i in b.items if (want is None and (("--all" in a) or i["section"] == "Open")) or i["section"] == want]
+    if "--json" in a:
+        print(json.dumps([{k: i[k] for k in ("id", "mark", "date", "text", "section")} | {"verdict": (i["extra"][0] if i["extra"] else "")} for i in rows]))
+        return
+    for i in rows:
+        print(f"[{i['mark']}] {i['id']}  {i['text']}   ({i['date']}{', ' + i['section'] if want is None and '--all' in a else ''})")
+        for e in i["extra"]:
+            print("      " + e.strip())
+    if not rows:
+        print("(nothing)")
+
+
+def cmd_close(name, a, mark, word):
+    writable(name)
+    b = Ideas(name); i = b.find(a[0])
+    i["mark"], i["section"] = mark, "Done / Dropped"
+    i["text"] = re.sub(r" · (done|dropped) \d{4}-\d{2}-\d{2}$", "", i["text"]) + f" · {word} {today()}"
+    b.save(f"{word} {i['id']}"); print(f"{name}: {i['id']} {word}")
+
+
+def cmd_verdict(name, a):
+    writable(name)
+    if len(a) < 2:
+        sys.exit('usage: idea verdict F3 "BUILD LATER · score 2.4 · reason"')
+    b = Ideas(name); i = b.find(a[0])
+    i["section"], i["extra"] = "Evaluated", [f"  ↳ verdict: {' '.join(a[1:]).strip()}"]
+    b.save(f"verdict {i['id']}"); print(f"{name}: {i['id']} evaluated")
+
+
+def cmd_move(name, a):
+    """Re-home an idea: it leaves this project's list and joins the other one (Inbox = the `ideas` project)."""
+    if "--to" not in a or len(a) < 3:
+        sys.exit("usage: idea move F3 --to PROJECT")
+    to = a[a.index("--to") + 1]
+    if to == name:
+        sys.exit("that idea is already in " + name)
+    writable(name); writable(to)
+    src, dst = Ideas(name), Ideas(to)
+    i = src.find(a[0]); new_id = dst.next_id()
+    dst.items.append({"mark": i["mark"], "id": new_id, "date": i["date"], "section": i["section"], "extra": i["extra"],
+                      "text": i["text"] if "(moved from" in i["text"] else f"{i['text']} (moved from {name} {i['id']})"})
+    src.items.remove(i)
+    src.save(f"move {i['id']} to {to}"); dst.save(f"{new_id} moved in from {name}")
+    print(f"{name} {i['id']} -> {to} {new_id}")
+
+
+def cmd_copy(name, a):
+    """Copy an idea to another project (the original stays). The copy starts as a fresh Open item there, without a verdict."""
+    if "--to" not in a or len(a) < 3:
+        sys.exit("usage: idea copy F3 --to PROJECT")
+    to = a[a.index("--to") + 1]
+    if to == name:
+        sys.exit("that idea is already in " + name)
+    writable(to)
+    if not project_exists(name):
+        sys.exit(f"no project {name} in {DEV}")
+    src, dst = Ideas(name), Ideas(to)
+    i = src.find(a[0]); new_id = dst.next_id()
+    dst.items.append({"mark": " ", "id": new_id, "date": today(), "section": "Open", "extra": [],
+                      "text": i["text"] if "(copied from" in i["text"] else f"{i['text']} (copied from {name} {i['id']})"})
+    dst.save(f"{new_id} copied in from {name}")
+    print(f"{name} {i['id']} -> {to} {new_id} (copy)")
+
+
+def cmd_prompt(name, a):
+    ids = ",".join(x.upper() for x in a) or "all open items"
+    print(f"Evaluate ideas {ids} of {name} per {WS}/docs/idea-review-method.md. Work in plan mode, one page per idea. End each page with a RECOMMENDATION: where the idea belongs (this project, another existing project, a new project, or merged with other ideas), "
+          "whether it is worth building, and the next step. Wait for my approval before writing anything.")
+
+
+STOP = set("the a an and or to of in for on with is it this that be as at by from add new make use when we our can will should".split())
+
+
+def words(t):
+    return {w for w in re.findall(r"[a-z][a-z0-9-]{3,}", t.lower()) if w not in STOP}
+
+
+def open_items():
+    rows = []
+    try:
+        names = project_names()
+    except Exception:
+        names = []
+    for n in names:
+        for i in Ideas(n).items:
+            if i["section"] == "Open":
+                rows.append((n, i["id"], i["text"]))
+    idea_dir = DEV / "ideas" / "ideas"
+    if idea_dir.exists():
+        for f in sorted(idea_dir.glob("*.md")):
+            t = f.read_text()
+            if re.search(r"(?i)status:\s*idea", t) or not re.search(r"(?i)status:", t):
+                rows.append(("ideas", f.stem, " ".join(t.split())[:300]))
+    return rows
+
+
+def cmd_index(a):
+    rows = open_items()
+    for n, i, t in rows:
+        print(f"{n:24} {i:12} {t[:100]}")
+    pairs = []
+    for x in range(len(rows)):
+        for y in range(x + 1, len(rows)):
+            if rows[x][0] == rows[y][0] and rows[x][0] != "ideas":
+                continue
+            tx, ty = set(re.findall(r"#\w+", rows[x][2])), set(re.findall(r"#\w+", rows[y][2]))
+            shared = (tx & ty) or (words(rows[x][2]) & words(rows[y][2]))
+            if len(tx & ty) >= 2 or len(words(rows[x][2]) & words(rows[y][2])) >= 3:
+                pairs.append((rows[x][:2], rows[y][:2], sorted(shared)[:5]))
+    print("\nLikely overlaps (confirm in the review):" if pairs else "\nNo likely overlaps.")
+    for p, q, s in pairs:
+        print(f"  {p[0]}/{p[1]}  ~  {q[0]}/{q[1]}   shared: {', '.join(s)}")
+
+
+# ---------- the idle ask ----------
+def newest_write(name):
+    root = HOME / ".claude/projects"
+    best = 0
+    try:
+        for d in root.iterdir():
+            if d.is_dir() and d.name.endswith("-" + name.replace(".", "-")) and "-tmp-" not in d.name:
+                for f in d.glob("*.jsonl"):
+                    best = max(best, f.stat().st_mtime)
+                    sub = f.with_suffix("") / "subagents"
+                    if sub.exists():
+                        for g in sub.glob("agent-*.jsonl"):
+                            best = max(best, g.stat().st_mtime)
+    except Exception:
+        pass
+    return best
+
+
+def cmd_nudge(a, out=print):
+    """`idea nudge`. out = where the one-line result goes (the guard passes a no-op so the daemon prints nothing)."""
+    dry, now, cfg = "--dry" in a, time.time(), config()
+    prefs = jread(STATE / "idea-prefs.json", {}) or {}
+    g, away = jread(STATE / "guard.json", {}) or {}, jread(STATE / "away.json", {}) or {}
+    if g.get("lid_closed") or (g.get("idle_s") or 0) >= cfg["owner_idle_s"] or away.get("away"):
+        return out("owner not at the Mac: no ask")
+    if now - prefs.get("last_ask", 0) < cfg["ask_cooldown_hours"] * 3600:
+        return out("already asked within the last day")
+    names = project_names() if DEV.exists() else []
+    for n in names:                                                 # a good moment = nobody is mid-task
+        if (jread(STATE / f"{n}.json", {}) or {}).get("state") in ("working", "needs-input"):
+            return out(f"{n} is working: not a good moment")
+    cands = []
+    for n in names:
+        if n in held() or n in prefs.get("never", []) or prefs.get("snooze", {}).get(n, 0) > now:
+            continue
+        st = jread(STATE / f"{n}.json", {}) or {}
+        ag = jread(STATE / f"{n}.agents.json", {}) or {}
+        if any(now - v.get("started", now) < 3 * 3600 for v in ag.values()):
+            continue
+        quiet = now - max(newest_write(n), st.get("ts", 0))
+        rc, ct = git(DEV / n, "log", "-1", "--format=%ct", "--", ".", ":(exclude)docs/FEATURE-IDEAS.md")      # adding an idea is not project activity
+        last_commit = int(ct.strip() or 0) if rc == 0 and ct.strip().isdigit() else 0
+        if quiet < cfg["idle_hours"] * 3600 or now - last_commit < cfg["idle_hours"] * 3600:
+            continue
+        count = sum(1 for i in Ideas(n).items if i["section"] == "Open")
+        asked = (prefs.get("asked", {}) or {}).get(n, {})
+        if count and (now - asked.get("ts", 0) > cfg["reask_days"] * 86400 or count > asked.get("count", 0)):
+            cands.append({"name": n, "count": count})
+    if not cands:
+        return out("nothing to ask about")
+    msg = ", ".join(f"{c['name']} {c['count']}" for c in cands)
+    out(f"ask: {msg}")
+    if dry:
+        return
+    prefs["last_ask"] = now
+    prefs.setdefault("asked", {}).update({c["name"]: {"ts": now, "count": c["count"]} for c in cands})
+    jwrite(STATE / "idea-prefs.json", prefs)
+    jwrite(STATE / "idea-ask.json", {"ts": int(now), "expires": int(now + 86400), "projects": cands})
+    try:      # off by default (prefs.notify = system, or the old config/notifications.json switch); the panel banner is the ask. A test run only reaches a recorder (SHIPMIRACLE_OSASCRIPT under SHIPMIRACLE_TEST=1). Never crashes when the OS has no notifier.
+        from shipmiracle import platform as shipmiracle_platform
+        shipmiracle_platform.notify("Shipmiracle", f"Idle projects with ideas: {msg}. Open the Shipmiracle panel to review.", ws=WS)
+    except Exception:
+        pass
+
+
+def nudge(argv=None, out=lambda *_a: None):
+    """Library entry for the guard's in-process job: same decisions and writes as `idea nudge`, prints nothing by default."""
+    return cmd_nudge(list(argv or []), out)
+
+
+def cmd_answer(op, a):
+    prefs = jread(STATE / "idea-prefs.json", {}) or {}
+    ask = jread(STATE / "idea-ask.json", {}) or {}
+    if op == "dismiss":
+        for c in ask.get("projects", []):
+            prefs.setdefault("snooze", {})[c["name"]] = time.time() + config()["reask_days"] * 86400
+    elif op == "snooze" and a:
+        prefs.setdefault("snooze", {})[a[0]] = time.time() + config()["reask_days"] * 86400
+    elif op == "never" and a:
+        prefs.setdefault("never", [])
+        if a[0] not in prefs["never"]:
+            prefs["never"].append(a[0])
+    else:
+        sys.exit(f"usage: idea {op} PROJECT")
+    jwrite(STATE / "idea-prefs.json", prefs)
+    if op == "dismiss" or (ask and a and a[0] in [c["name"] for c in ask.get("projects", [])]):
+        left = [c for c in ask.get("projects", []) if op != "dismiss" and (not a or c["name"] != a[0])]
+        (STATE / "idea-ask.json").unlink(missing_ok=True) if not left else jwrite(STATE / "idea-ask.json", {**ask, "projects": left})
+    print("ok")
+
+
+def main(argv=None):
+    a = sys.argv[1:] if argv is None else list(argv)
+    if not a or a[0] in ("-h", "--help", "help"):
+        return print(__doc__)
+    if a[0] == "index":
+        return cmd_index(a[1:])
+    if a[0] == "nudge":
+        return cmd_nudge(a[1:])
+    if a[0] in ("snooze", "never", "dismiss"):
+        return cmd_answer(a[0], a[1:])
+    name = project_name(a)
+    if not name or name.startswith(".") or "/" in name or "\x00" in name:         # read-only commands too: no path traversal through -p
+        sys.exit(f"no project {name} in {DEV}")
+    cmd, rest = a[0], a[1:]
+    if cmd == "add": cmd_add(name, rest)
+    elif cmd == "list": cmd_list(name, rest)
+    elif cmd == "done": cmd_close(name, rest, "x", "done")
+    elif cmd == "drop": cmd_close(name, rest, "-", "dropped")
+    elif cmd == "verdict": cmd_verdict(name, rest)
+    elif cmd == "move": cmd_move(name, rest)
+    elif cmd == "copy": cmd_copy(name, rest)
+    elif cmd == "eval-prompt": cmd_prompt(name, rest)
+    else: print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

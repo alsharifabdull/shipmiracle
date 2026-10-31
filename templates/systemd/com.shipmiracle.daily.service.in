@@ -1,0 +1,9 @@
+[Unit]
+Description=Shipmiracle daily maintenance (plugins, skills, extensions, health report)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash "@WS@/bin/daily"
+StandardOutput=append:@STATE@/v1/logs/systemd-daily.log
+StandardError=inherit
+NoNewPrivileges=yes

@@ -1,0 +1,12 @@
+# Only GitHub Actions: the Python code uses the standard library only and the VS Code extension has no runtime dependencies.
+# Dependabot proposes the new commit SHA for a pinned action and keeps the tag in the comment. Nothing is merged automatically:
+# the repository is a one-way export, so the maintainer ports an accepted bump by hand.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    open-pull-requests-limit: 3

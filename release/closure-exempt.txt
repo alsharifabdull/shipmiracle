@@ -1,0 +1,8 @@
+# Reviewed exceptions to the release-check closure rule (a file the export tree mentions but does not carry).
+# One entry per line:  <file path in the export tree> | <referenced target> | <text the referencing line must contain>
+# No line numbers, so an entry survives edits elsewhere in the file. Every entry needs a "why" comment above it. The match is exact on
+# path and target and a substring on the line; nothing else is exempt. release/ is hard-never; a copy of this file is shipped through release/overlay/release/ so release-check works on the exported tree (a test keeps both identical).
+#
+# docs/standards/base.md is the managed block that sync writes into the AGENTS.md of every existing project; rewording this line would change
+# that block for all of them. A stranger reading it sees a reference to the private flow gate script; the public flow gate is shipmiracle/hooks/flow.py.
+docs/standards/base.md | hooks/flow-gate.sh | enforces the flow

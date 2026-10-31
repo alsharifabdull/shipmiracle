@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""flow-report [days] — the team flow per project over the last N days (default 7): plans by the plan-role agent or not,
+refusals, small fixes, escape hatches, files changed outside the team, QA runs, and the Opus/Sonnet share of Claude replies
+(main chats and agents, from the transcripts). Sources: ~/.local/state/shipmiracle/flow-events.jsonl and ~/.claude/projects/."""
+import collections, glob, json, os, re, sys, time
+days = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+HOME = os.path.expanduser("~"); STATE = os.environ.get("SHIPMIRACLE_STATE") or os.path.join(HOME, ".local/state/shipmiracle")
+PROJ = os.environ.get("SHIPMIRACLE_CLAUDE_PROJECTS") or os.path.join(HOME, ".claude/projects")
+since = time.time() - days * 86400
+ev = collections.defaultdict(collections.Counter)
+try:
+    for line in open(os.path.join(STATE, "flow-events.jsonl"), errors="ignore"):
+        try: e = json.loads(line)
+        except Exception: continue
+        if e.get("ts", 0) >= since: ev[e.get("project", "?")][e.get("event", "?")] += 1
+except OSError:
+    pass
+models = collections.defaultdict(collections.Counter)
+for d in glob.glob(os.path.join(PROJ, "*Developer-*")):
+    name = re.sub(r"^.*-Developer-", "", os.path.basename(d))
+    for f in glob.glob(os.path.join(d, "*.jsonl")) + glob.glob(os.path.join(d, "*/subagents/*.jsonl")):
+        try:
+            if os.path.getmtime(f) < since: continue
+            with open(f, "rb") as fh:
+                fh.seek(max(0, os.path.getsize(f) - 8_000_000)); data = fh.read().decode("utf-8", "ignore")
+        except OSError:
+            continue
+        for m in re.finditer(r'"model":"(claude-[a-z]+)', data):
+            models[name]["Opus" if "opus" in m.group(1) else "Sonnet" if "sonnet" in m.group(1) else "Haiku" if "haiku" in m.group(1) else "Other"] += 1
+names = sorted(set(ev) | set(models))
+print(f"Team flow, last {days} days")
+if not names:
+    print("  no activity"); sys.exit(0)
+for n in names:
+    e, m = ev[n], models[n]; tot = sum(m.values()) or 1
+    share = " · ".join(f"{k} {100 * v // tot} %" for k, v in m.most_common())
+    print(f"  {n}: plans by the architect {e['plan_ok']}, plans refused {e['plan_without_architect']}, edits refused {e['edit_outside_team'] + e['bash_write_outside_team']}, "
+          f"small fixes {e['small_fix']}, escape hatches {e['bypass']}, stops refused for QA {e['done_without_qa']} (QA FAIL/BLOCKED {e['qa_failed']}, no verdict {e['qa_no_verdict']}), "
+          f"QA escapes {e['done_without_qa_capped'] + e['qa_failed_capped'] + e['qa_no_verdict_capped'] + e['bypass_qa_failed']} (capped or bypassed), warned {e['qa_failed_warned'] + e['qa_no_verdict_warned'] + e['done_without_qa_warned']}, "
+          f"changed outside the team {e['outside_team']}"
+          + (f" | replies: {share}" if m else ""))

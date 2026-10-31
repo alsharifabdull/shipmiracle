@@ -1,0 +1,9 @@
+# Names allowed after /Users/ in exported files (release-check home-path rule), one per line, compared case-insensitively.
+x
+example
+someone
+you
+a.b
+some.other-user
+<owner>
+$USER

@@ -1,0 +1,130 @@
+{
+ "agent-browser": {
+  "commit": "021d9255e543d2f1ab66b87f338d85c3d7a910be",
+  "path": "skills/agent-browser",
+  "pkg": "vercel-labs/agent-browser",
+  "tree_sha256": "2315208a8da6e3b598623c2343ef81f095c6bfde2158ca60638ed40c41b64a72",
+  "upstream_folder_hash": "82def67855a0d2aad7794207951820fa5422fdb0"
+ },
+ "apple-design": {
+  "commit": "a81dbca07f2217b7103e510c0f13f8d5b017afc9",
+  "path": "skills/apple-design",
+  "pkg": "emilkowalski/skills",
+  "tree_sha256": "f4c03cf3ff5f30203f06ce7864d1c1b61164422e7e7783b8523a759aebbbefdd"
+ },
+ "break-ui": {
+  "commit": "a81dbca07f2217b7103e510c0f13f8d5b017afc9",
+  "path": "skills/break-ui",
+  "pkg": "emilkowalski/skills",
+  "tree_sha256": "472638c8175bc07a14a3f6eb22d743960e46646c2a94902e72ac36bff663505f"
+ },
+ "codebase-design": {
+  "commit": "d80fa0f4ebe0c5714af0adf8670336065233ecc6",
+  "path": "skills/engineering/codebase-design",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "19643ae2909d1b647bd3a351971f0ab796f9a4528f7ce4014b97c3b87089ddb7",
+  "upstream_folder_hash": "07ba1cd60efc12d0d3a083005c1d9651cf15e39a"
+ },
+ "diagnosing-bugs": {
+  "commit": "f3fc5632f401156837ee3872f14fe33ccf1024ea",
+  "path": "skills/engineering/diagnosing-bugs",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "111dc995a68f34008f05628918fbcb2944b7782a27850876d3a3a8bdb865f2d5",
+  "upstream_folder_hash": "5fdd6cc53385395441910b026c72d71768e993d4"
+ },
+ "domain-modeling": {
+  "commit": "d80fa0f4ebe0c5714af0adf8670336065233ecc6",
+  "path": "skills/engineering/domain-modeling",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "ccb9b898be597eb0836af78f4e7c10ee808dd952c04439e1fd9e887fcbba732e",
+  "upstream_folder_hash": "ea30ee454ba264543dbe40737973b1a5afb9f0e6"
+ },
+ "emil-design-eng": {
+  "commit": "a81dbca07f2217b7103e510c0f13f8d5b017afc9",
+  "path": "skills/emil-design-eng",
+  "pkg": "emilkowalski/skills",
+  "tree_sha256": "9c187de1c5c84331839ca4336c646f8fd6c4618b6e4c42934babfa9588bf14d0"
+ },
+ "grill-me": {
+  "commit": "fcf0071560d32913c9d4f820e0d7ca467c881619",
+  "path": "skills/productivity/grill-me",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "f01a65e88f7886822a81ea9a3bb9d4d55f655f2dc05d9a03740fc73af9d2e805",
+  "upstream_folder_hash": "3df14e2d3a89459bf300614be9247e3ce74798f8"
+ },
+ "grill-with-docs": {
+  "commit": "447ca70872026d5b79d6073a546dac082117fed7",
+  "path": "skills/engineering/grill-with-docs",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "6ecbb94ce3ec21fc86fb8199b0e11b5c2ed8f7c65b87b8175ce84c3b8a541c3c",
+  "upstream_folder_hash": "eedaf2562c83155115e9c649fa3ecaac2e10e81d"
+ },
+ "handoff": {
+  "commit": "0f5e033ebc47b142f5ffa56a582ede6d9d9bada3",
+  "path": "skills/productivity/handoff",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "b4f2eada962bf3f9f63421377fff628f6946a4eeef3b10b59dbcebd29ecc684b",
+  "upstream_folder_hash": "ce24892bd2d4b9e7fd5ac9b95c03175e18bef388"
+ },
+ "impeccable": {
+  "commit": "414603bf14c7a344edb466bb1f85690c77ce8b7d",
+  "path": ".agents/skills/impeccable",
+  "pkg": "pbakaus/impeccable",
+  "tree_sha256": "6f3f0bd2433bd6ca7f8084aba60f931d1fe0616faf5e3f2eb6e675afd596947d",
+  "upstream_folder_hash": "8305acdb8704446cfd0a3e6d7f29fbab836eb746"
+ },
+ "improve-codebase-architecture": {
+  "commit": "d80fa0f4ebe0c5714af0adf8670336065233ecc6",
+  "path": "skills/engineering/improve-codebase-architecture",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "ab9f888973aebccd284359cab2822c0b08ee760c544f43fdd906516193bf85f3",
+  "upstream_folder_hash": "39bd9cc130f7dfcc4e3ea0b3613f6ebed0d0ad2b"
+ },
+ "prototype": {
+  "commit": "321658273cb1d20b76026717d027d505790106d4",
+  "path": "skills/engineering/prototype",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "4b198e7e515d42fd00dd43fdebec7dccc3e59273ecbb501bc0fdb02c516ef7f9",
+  "upstream_folder_hash": "e41d92e171f074a2b6887d8f6faca4a15c83d1ca"
+ },
+ "review-animations": {
+  "commit": "a81dbca07f2217b7103e510c0f13f8d5b017afc9",
+  "path": "skills/review-animations",
+  "pkg": "emilkowalski/skills",
+  "tree_sha256": "daea4f598bdcf3eddfb8667c4926d4bfe178ea9236e94ac342d6adc00e89fb94"
+ },
+ "tdd": {
+  "commit": "3f599139104dfceabc7754eeb91319802f85e042",
+  "path": "skills/engineering/tdd",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "8d3262337d4e7c362fdb82b283f1b309a0a2061dc2c99f987e2802835ff69bab",
+  "upstream_folder_hash": "667dbdd00c09d0e2189e082986e6a4d61a67c2a6"
+ },
+ "triage": {
+  "commit": "d80fa0f4ebe0c5714af0adf8670336065233ecc6",
+  "path": "skills/engineering/triage",
+  "pkg": "mattpocock/skills",
+  "tree_sha256": "94921c51582bcc79c2983e82643bef171bfff964166da529b20cb0ba8ecd24a3",
+  "upstream_folder_hash": "4cb951d62ecccaed601cdc5f9a1b7b3d8a799635"
+ },
+ "vercel-composition-patterns": {
+  "commit": "a5343bd997c4cc4d8bf2ca61021bdc74b4d6c9d5",
+  "path": "skills/composition-patterns",
+  "pkg": "vercel-labs/agent-skills",
+  "tree_sha256": "b565602f3619e12a66179b679175e099762cc77ac95b702d33ce35a5d0f40b3d",
+  "upstream_folder_hash": "bf90d0a4b83ea054653350f9c67f6de235d3a368"
+ },
+ "vercel-react-best-practices": {
+  "commit": "dc8367e6f91c022d83361f03c3313fa05e848ee5",
+  "path": "skills/react-best-practices",
+  "pkg": "vercel-labs/agent-skills",
+  "tree_sha256": "57cf6063b85c9fc7bfbed58289e8f5abf3e98cf2f4d1b9ccba028f198bdf4235",
+  "upstream_folder_hash": "343db72180d05814949fef7d46be96b5c6ee86b3"
+ },
+ "write-swift": {
+  "commit": "a81dbca07f2217b7103e510c0f13f8d5b017afc9",
+  "path": "skills/write-swift",
+  "pkg": "emilkowalski/skills",
+  "tree_sha256": "b0f0b3cf5b67ec6d6686760847f15a8ca2614ba2d0e2cd6f2c273106f57dd4fc"
+ }
+}

@@ -1,0 +1,126 @@
+{
+  "name": "shipmiracle-panel",
+  "displayName": "Shipmiracle",
+  "description": "Every project at a glance: state, active agents, token use, plan meters; open, create and manage projects.",
+  "version": "0.5.2",
+  "publisher": "shipmiracle",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "shipmiracle",
+          "title": "Shipmiracle",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "shipmiracle": [
+        {
+          "type": "webview",
+          "id": "shipmiracle.projects",
+          "name": "Shipmiracle"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Shipmiracle",
+      "properties": {
+        "shipmiracle.cardChatExcerpt": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show the chat's last message inside a project card's Details. Chat text can show on screen shares. Text that looks like a key, token or password is masked as [hidden] (best-effort masking, about 89% of the secret shapes in a fresh corpus we had not tuned for, not a guarantee: a bare password in a sentence or a secret with no key name around it can still show, and code-like text can be masked too)."
+        },
+        "shipmiracle.unreadMarker": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a small New marker on a project when its chat finished a turn or needs you."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "shipmiracle.focus",
+        "title": "Shipmiracle: Show projects"
+      },
+      {
+        "command": "shipmiracle.refresh",
+        "title": "Shipmiracle: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "shipmiracle.newProject",
+        "title": "Shipmiracle: New project",
+        "icon": "$(add)"
+      },
+      {
+        "command": "shipmiracle.check",
+        "title": "Shipmiracle: Check & update",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "shipmiracle.activateAgent",
+        "title": "Shipmiracle: Activate agent…"
+      },
+      {
+        "command": "shipmiracle.openNewWindow",
+        "title": "Open project in new window"
+      },
+      {
+        "command": "shipmiracle.openFolderHere",
+        "title": "Open project folder in this window"
+      },
+      {
+        "command": "shipmiracle.promote",
+        "title": "Promote an agent from this project\u2026"
+      },
+      {
+        "command": "shipmiracle.delete",
+        "title": "Delete project\u2026"
+      },
+      {
+        "command": "shipmiracle.reveal",
+        "title": "Reveal in Finder"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "shipmiracle.delete", "when": "shipmiracle.deleteAvailable" }
+      ],
+      "webview/context": [
+        {
+          "command": "shipmiracle.openNewWindow",
+          "when": "webviewId == 'shipmiracle.projects' && webviewSection == 'project'",
+          "group": "1_open@1"
+        },
+        {
+          "command": "shipmiracle.openFolderHere",
+          "when": "webviewId == 'shipmiracle.projects' && webviewSection == 'project'",
+          "group": "1_open@2"
+        },
+        {
+          "command": "shipmiracle.reveal",
+          "when": "webviewId == 'shipmiracle.projects' && webviewSection == 'project'",
+          "group": "1_open@3"
+        },
+        {
+          "command": "shipmiracle.promote",
+          "when": "webviewId == 'shipmiracle.projects' && webviewSection == 'project'",
+          "group": "2_manage@1"
+        },
+        {
+          "command": "shipmiracle.delete",
+          "when": "webviewId == 'shipmiracle.projects' && webviewSection == 'project' && shipmiracle.deleteAvailable",
+          "group": "2_manage@2"
+        }
+      ]
+    }
+  }
+}

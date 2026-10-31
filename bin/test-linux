@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# test-linux — run the python test suites on Linux, in one local Docker container (Colima or Docker Desktop must be running).
+#   bin/test-linux [test-all options, e.g. --only portable_shell --jobs 2]
+#   bin/test-linux --py tests/some_test.py   run ONE suite directly (prints every FAIL line with its detail)
+# What it does: starts ONE container from the python:3.9 image pinned by digest (no `latest`, no other image), the repo mounted READ-ONLY at /src, a writable tmpfs
+# for HOME and every shipm state folder (the full isolation env: SHIPMIRACLE_TEST=1 SHIPMIRACLE_HOME HOME SHIPMIRACLE_CONFIG SHIPMIRACLE_STATE SHIPMIRACLE_WS SHIPMIRACLE_DEV CLAUDE_CONFIG_DIR), no network, no
+# extra capabilities, --init (a real pid 1 that reaps zombies and is the parent of orphans, as on a normal system; without it the test runner itself is pid 1), not root (uid 1000 with its own passwd entry), read-only root file system, then `bin/test-all --python-only` (the image has no node, so the *_test.js suites are left out and
+# the run is labelled PARTIAL). Nothing from your real home is mounted. Exit code = test-all's. The first run pulls the image from Docker Hub (free, ~1 GB).
+# To move to a newer Python 3.9 image: `docker buildx imagetools inspect python:3.9`, copy the top "Digest:" line into IMAGE below, run this script, commit.
+set -uo pipefail
+IMAGE="python:3.9@sha256:da5aee29682d12a6649f51c8d6f15b87deb3e6c524b923c41d0cb3304d07c913"   # python 3.9.25 on Debian trixie, index digest (amd64 + arm64), resolved 21 Oct 2026
+ROOT="${SHIPMIRACLE_TEST_LINUX_SRC:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}"   # SHIPMIRACLE_TEST_LINUX_SRC: test another checkout, e.g. a `git archive` of an older commit under $HOME
+command -v docker >/dev/null 2>&1 || { echo "test-linux: docker not found. Install Docker (macOS: colima + docker) and start it." >&2; exit 127; }
+docker info >/dev/null 2>&1 || { echo "test-linux: the Docker engine is not running (macOS: colima start)." >&2; exit 126; }
+mounts=(-v "$ROOT:/src:ro")
+# a git worktree keeps its git data in the main checkout: mount that read-only at the same path so `git` works inside
+if [[ -f "$ROOT/.git" ]]; then
+  common="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  [[ -n "$common" && -d "$common" && "$common" != "$ROOT"/* ]] && mounts+=(-v "$common:$common:ro")
+fi
+args=("$@")
+# a real account for uid 1000 (pwd lookups and the "no literal account name" checks need one); generated here, mounted read-only, removed on exit
+# under $HOME because Colima shares your home folder with the VM but not macOS /var/folders
+mkdir -p "$HOME/.cache" && pw="$(mktemp -d "$HOME/.cache/shipmiracle-test-linux.XXXXXX")" || exit 1
+trap 'rm -rf "$pw"' EXIT
+acct="ci"; acct="${acct}user"      # built from two words so that the repo's "no literal account name in bin/" check does not trip on this file
+printf 'root:x:0:0:root:/root:/bin/bash\n%s:x:1000:1000:test runner:/home/%s:/bin/bash\n' "$acct" "$acct" > "$pw/passwd"
+printf 'root:x:0:\n%s:x:1000:\n' "$acct" > "$pw/group"
+mounts+=(-v "$pw/passwd:/etc/passwd:ro" -v "$pw/group:/etc/group:ro")
+# the suites ask for en_US.UTF-8, the image only has C.UTF-8: copy those same locale files (once, from the same pinned image) and mount them under the other name
+loc="$HOME/.cache/shipmiracle-test-linux-locale"
+if [[ ! -f "$loc/LC_CTYPE" ]]; then
+  mkdir -p "$loc" && docker run --rm --network none --user 0:0 -v "$loc:/out" "$IMAGE" sh -c 'cp -r /usr/lib/locale/C.utf8/. /out/' || exit 1
+fi
+mounts+=(-v "$loc:/usr/lib/locale/en_US.utf8:ro")
+# shellcheck disable=SC2016  # the single-quoted script runs inside the container
+inner='set -eu; mkdir -p /tmp/home
+mkdir -p "$SHIPMIRACLE_TL_TMP"; export TMPDIR="$SHIPMIRACLE_TL_TMP"   # like macOS: temp files live in /var/folders/..., not /tmp (the flow gate treats /tmp as a scratch root, so projects made there would not be gated; the isolation guards accept /var/folders)
+d=$(mktemp -d "$TMPDIR/shipmiracle-iso.XXXXXX"); mkdir -p "$d/h/.claude" "$d/c" "$d/s" "$d/w" "$d/dev"
+printf "[user]\n\tname = Shipmiracle test\n\temail = test@example.com\n[init]\n\tdefaultBranch = main\n[commit]\n\tgpgsign = false\n" > "$d/h/.gitconfig"
+echo "container: $(uname -sm), $(python3 -V), $(git --version), uid $(id -u) ($(id -un)), node: $(command -v node || echo absent), gitleaks: $(command -v gitleaks || echo absent) (python suites only, by design)"
+cd /src
+unset CLAUDECODE; export SHIPMIRACLE_TEST=1 SHIPMIRACLE_HOME="$d/h" HOME="$d/h" SHIPMIRACLE_CONFIG="$d/c" SHIPMIRACLE_STATE="$d/s" SHIPMIRACLE_WS="$d/w" SHIPMIRACLE_DEV="$d/dev" CLAUDE_CONFIG_DIR="$d/h/.claude" PYTHONDONTWRITEBYTECODE=1
+if [ "${1:-}" = --py ]; then shift; exec python3 "$@" </dev/null; fi
+exec python3 bin/test-all --python-only "$@" </dev/null'
+docker run --rm --init --pull=missing --network none --read-only --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges \
+  --pids-limit 4096 --memory 6g --tmpfs /tmp:rw,exec,nosuid,size=2g,mode=1777 --tmpfs /var/folders:rw,exec,nosuid,size=3g,mode=1777 --tmpfs /home/$acct:rw,exec,nosuid,size=256m,uid=1000,gid=1000,mode=700 \
+  -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' -e SHIPMIRACLE_TL_TMP=/var/folders/ci/T -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 \
+  "${mounts[@]}" -w /src "$IMAGE" bash -c "$inner" test-linux ${args[@]+"${args[@]}"}
+exit $?

@@ -1,0 +1,9 @@
+.DS_Store
+__pycache__/
+*.pyc
+reports/
+_backup/
+.env
+.env.*
+!.env.example
+*.log

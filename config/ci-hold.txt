@@ -1,0 +1,1 @@
+# Projects the sync tooling must not touch (one name per line). Empty by default.

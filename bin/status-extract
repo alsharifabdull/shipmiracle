@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""status-extract [project-dir] — the part of docs/STATUS.md a new session needs, always complete and never over the cap.
+Keeps: title, Updated line, intro, then In progress / Next / Not verified / Last verification / Handoff in full;
+every other section as its heading plus its first line. Cap 6000 bytes (Claude Code cuts hook output near 10 KB)."""
+import os, re, sys
+CAP = int(os.environ.get("SHIPMIRACLE_BRIEF_CAP", "6000"))
+KEEP = re.compile(r"^(in progress|next|not verified|last verification|handoff)", re.I)
+d = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("CLAUDE_PROJECT_DIR", ".")
+try: text = open(os.path.join(d, "docs", "STATUS.md"), encoding="utf-8").read()
+except OSError: sys.exit(print("docs/STATUS.md missing: create it from the template before working.") or 0)
+parts = re.split(r"(?m)^(?=## )", text)
+head, secs = parts[0], parts[1:]
+out = [head.rstrip()[:1800]]
+for s in secs:
+    title, _, body = s.partition("\n")
+    if KEEP.match(title[3:].strip()):
+        out.append(s.rstrip())
+    else:
+        first = next((l for l in body.splitlines() if l.strip()), "")
+        out.append(title + "\n" + first[:200] + "  …")
+res, used = [], 0
+keep_full = [o for o in out if KEEP.match(o[3:].strip()) or not o.startswith("## ")]
+fixed = sum(len(o) + 2 for o in keep_full)
+for o in out:
+    full = KEEP.match(o[3:].strip()) or not o.startswith("## ")
+    if not full and used + len(o) + fixed > CAP: continue
+    if not full: used += len(o) + 2
+    res.append(o)
+body = "\n\n".join(res)
+if len(body) > CAP + 3000: body = body[:CAP + 3000] + "\n… (cut)"
+size = len(text.encode("utf-8"))
+note = f"STATUS.md is {size/1024:.1f} KB, brief {len(body.encode('utf-8'))/1024:.1f} KB (cap {CAP} B)"
+if size > 25000: note += "; STATUS is over 25 KB: run bin/status-trim in the Shipmiracle engine folder"
+print(body + f"\n\n[{note}; full text in docs/STATUS.md, older entries in docs/status-archive/]")

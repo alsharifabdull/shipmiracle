@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""shipm-ledger: token ledger of every Claude call, cache reads included (Platform v2 P1). python3 stdlib only.
+
+Reads ~/.claude/projects/*/*.jsonl and */*/subagents/*.jsonl INCREMENTALLY (an offset cache remembers how far each file
+was read, so a repeat run reads only new bytes) and writes, into SHIPMIRACLE_STATE (default ~/.local/state/shipmiracle):
+  ledger.jsonl         append-only, one row per assistant call:
+                       {id, ts, project, session, agent_type, model, ctx_tokens, cache_read, cache_write, fresh, output, kind}
+                       ctx_tokens = fresh + cache_write + cache_read; kind = main | sub. A message id that streams in several
+                       copies is appended again only when a later copy has MORE output tokens; readers keep the copy with the most.
+  ledger.summary.json  compact numbers for the panel (today and 7 days: tokens incl. cache reads, share of calls and of tokens
+                       at/above 200k context, average main-chat context per project, context resets, per-role tokens).
+  ledger.offsets.json  the offset cache (safe to delete: the summary de-duplicates, nothing is lost).
+The ledger is rotated at 20 MB (ledger.jsonl -> ledger.jsonl.1). Corrupt lines are skipped. Read-only on ~/.claude;
+never runs a project script; state files are 0600, written atomically.
+
+  shipm-ledger --update            read new bytes, append rows, refresh the summary (default)
+  shipm-ledger --summary           print the summary in words
+  shipm-ledger --json              print ledger.summary.json
+  options: --state DIR --projects DIR --now EPOCH (tests)"""
+import argparse, collections, fcntl, json, os, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from shipmiracle import paths as shipmiracle_paths  # noqa: E402
+
+SOFT = 200_000
+ROTATE_BYTES = 20 * 1024 * 1024
+KEEP_DAYS = 8                       # rows and de-dup ids older than this are not needed by the summary
+RESET_FLOOR = 20_000                # a drop only counts as a context reset when the context was at least this big before it
+HOME = os.path.expanduser("~")
+
+
+def state_dir(arg=None):
+    return arg or os.environ.get("SHIPMIRACLE_STATE") or os.path.join(HOME, ".local", "state", "shipmiracle")
+
+
+def projects_dir(arg=None):
+    return arg or os.environ.get("SHIPMIRACLE_LEDGER_PROJECTS") or os.path.join(HOME, ".claude", "projects")
+
+
+def ensure_dir(d):
+    os.makedirs(d, mode=0o700, exist_ok=True)
+
+
+def atomic_write(path, text):
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def parse_ts(s):
+    """'2026-10-20T12:34:56.789Z' -> epoch seconds (UTC) or None."""
+    import calendar
+    try:
+        base = calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
+        return base + (float("0" + s[19:].rstrip("Z")) if len(s) > 19 and s[19] == "." else 0)
+    except Exception:
+        return None
+
+
+def project_of(cwd, dirname):
+    """Project name: first folder under ~/Developer of the call's cwd (worktrees map to their project), else the folder name."""
+    if isinstance(cwd, str) and cwd.startswith("/"):
+        parts = [p for p in cwd.split("/") if p]
+        dev = HOME.strip("/").split("/") + ["Developer"]
+        if parts[:len(dev)] == dev and len(parts) > len(dev):
+            rest = parts[len(dev):]
+            if rest[0] == ".worktrees" and len(rest) > 1:
+                return rest[1]
+            return rest[0]
+        if parts[:len(dev) - 1] == dev[:-1] and len(parts) > len(dev) - 1:
+            return parts[len(dev) - 1]                    # an older home-level path such as ~/<project>
+    home_dir = shipmiracle_paths.claude_dirname(HOME)                    # Claude's folder name of this account's home (was a hard-coded user name)
+    d = dirname.replace(home_dir + "-Developer-", "").replace(home_dir + "-", "~")
+    return d or "?"
+
+
+def transcript_files(root, since):
+    """(path, is_sub) for jsonl files modified since `since`."""
+    out = []
+    try:
+        top = os.listdir(root)
+    except OSError:
+        return out
+    for d in top:
+        dp = os.path.join(root, d)
+        try:
+            ents = os.listdir(dp)
+        except OSError:
+            continue
+        for e in ents:
+            p = os.path.join(dp, e)
+            if e.endswith(".jsonl"):
+                out.append((p, False))
+            else:
+                sd = os.path.join(p, "subagents")
+                try:
+                    subs = os.listdir(sd)
+                except OSError:
+                    continue
+                out.extend((os.path.join(sd, s), True) for s in subs if s.endswith(".jsonl"))
+    keep = []
+    for p, sub in out:
+        try:
+            if os.path.getmtime(p) >= since:
+                keep.append((p, sub))
+        except OSError:
+            pass
+    return sorted(keep)
+
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            v = json.load(f)
+        return v if isinstance(v, type(default)) else default
+    except Exception:
+        return default
+
+
+def agent_type(path):
+    try:
+        with open(path[:-6] + ".meta.json") as f:
+            return str(json.load(f).get("agentType") or "?")[:60]
+    except Exception:
+        return "?"
+
+
+def read_new(path, sub, off, cutoff, ids, rows):
+    """Read complete lines after `off`; return the new offset. Appends rows for new/improved message ids."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return off
+    if size < off:
+        off = 0                                           # file was replaced or truncated: read it again (ids stop duplicates)
+    if size == off:
+        return off
+    sep = os.sep + "subagents" + os.sep
+    dirname = path.split(os.sep + "projects" + os.sep)[-1].split(os.sep)[0]
+    session = path.split(sep)[0].split(os.sep)[-1] if sub else os.path.basename(path)[:-6]
+    role = agent_type(path) if sub else "main"
+    with open(path, "rb") as f:
+        f.seek(off)
+        data = f.read(size - off)
+    end = data.rfind(b"\n")
+    if end < 0:
+        return off                                        # no complete line yet
+    for line in data[:end].split(b"\n"):
+        if b'"usage"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+            msg = d.get("message")
+            u = msg.get("usage")
+            mid = msg.get("id")
+            if not (isinstance(u, dict) and isinstance(mid, str) and mid):
+                continue
+            ts = parse_ts(d.get("timestamp") or "")
+            if ts is None or ts < cutoff:
+                continue
+            fresh, cw, cr, out = (int(u.get("input_tokens") or 0), int(u.get("cache_creation_input_tokens") or 0),
+                                  int(u.get("cache_read_input_tokens") or 0), int(u.get("output_tokens") or 0))
+        except Exception:
+            continue                                      # corrupt or odd line: skip it
+        ctx = fresh + cw + cr
+        if ctx <= 0:
+            continue
+        old = ids.get(mid)
+        if old is not None and out <= old[0]:
+            continue
+        ids[mid] = [out, ts]
+        rows.append({"id": mid, "ts": round(ts, 3), "project": project_of(d.get("cwd"), dirname), "session": str(d.get("sessionId") or session)[:64],
+                     "agent_type": role, "model": str(msg.get("model") or "?")[:60], "ctx_tokens": ctx, "cache_read": cr, "cache_write": cw,
+                     "fresh": fresh, "output": out, "kind": "sub" if sub else "main"})
+    return off + end + 1
+
+
+def update(state, root, now):
+    ensure_dir(state)
+    lock = os.fdopen(os.open(os.path.join(state, "ledger.lock"), os.O_WRONLY | os.O_CREAT, 0o600), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return {"busy": True, "rows": 0}                  # another run is active: it will do the work
+    cutoff = now - KEEP_DAYS * 86400
+    offp = os.path.join(state, "ledger.offsets.json")
+    cache = load_json(offp, {})
+    files = cache.get("files") if isinstance(cache.get("files"), dict) else {}
+    ids = cache.get("ids") if isinstance(cache.get("ids"), dict) else {}
+    rows = []
+    seen = set()
+    for path, sub in transcript_files(root, cutoff):
+        seen.add(path)
+        ent = files.get(path)
+        off = ent[0] if isinstance(ent, list) and ent and isinstance(ent[0], int) else 0
+        files[path] = [read_new(path, sub, off, cutoff, ids, rows)]
+    for p in [p for p in files if p not in seen]:         # not touched for KEEP_DAYS (or gone): forget it
+        del files[p]
+    for k in [k for k, v in ids.items() if not (isinstance(v, list) and len(v) == 2 and v[1] >= cutoff)]:
+        del ids[k]
+    led = os.path.join(state, "ledger.jsonl")
+    try:
+        if os.path.getsize(led) > ROTATE_BYTES:
+            os.replace(led, led + ".1")
+    except OSError:
+        pass
+    if rows:
+        fd = os.open(led, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+    atomic_write(offp, json.dumps({"v": 1, "files": files, "ids": ids}, separators=(",", ":")))
+    summ = os.path.join(state, "ledger.summary.json")
+    old = load_json(summ, {})
+    day = local_day(now)
+    if rows or old.get("day") != day or not old:
+        write_summary(state, now)
+    else:                                                 # nothing new: only mark it fresh
+        old["generated_at"] = int(now)
+        atomic_write(summ, json.dumps(old, separators=(",", ":")))
+    return {"busy": False, "rows": len(rows)}
+
+
+def local_day(t):
+    return time.strftime("%Y-%m-%d", time.localtime(t))
+
+
+def read_rows(state, since):
+    """All ledger rows since `since`, de-duplicated by message id (the copy with the most output tokens wins)."""
+    best = {}
+    for name in ("ledger.jsonl.1", "ledger.jsonl"):
+        try:
+            f = open(os.path.join(state, name), "rb")
+        except OSError:
+            continue
+        with f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    if r["ts"] < since:
+                        continue
+                    k = r.get("id") or (r["session"], r["ts"])
+                    o = best.get(k)
+                    if o is None or r["output"] >= o["output"]:
+                        best[k] = r
+                except Exception:
+                    continue                              # corrupt line
+    return list(best.values())
+
+
+def block(rs):
+    n = len(rs)
+    ctx = sum(r["ctx_tokens"] for r in rs)
+    out = sum(r["output"] for r in rs)
+    over = [r for r in rs if r["ctx_tokens"] >= SOFT]
+    return {"calls": n, "tokens": ctx + out, "ctx_tokens": ctx, "cache_read": sum(r["cache_read"] for r in rs),
+            "cache_write": sum(r["cache_write"] for r in rs), "fresh": sum(r["fresh"] for r in rs), "output": out,
+            "calls_over_200k": len(over),
+            "share_calls_over_200k_pct": round(100.0 * len(over) / n, 1) if n else None,
+            "share_tokens_over_200k_pct": round(100.0 * sum(r["ctx_tokens"] + r["output"] for r in over) / (ctx + out), 1) if ctx + out else None}
+
+
+def resets(rs):
+    """Sessions (main chat) whose context fell by more than half between two consecutive calls: compact or fresh start."""
+    by = collections.defaultdict(list)
+    for r in rs:
+        if r["kind"] == "main":
+            by[r["session"]].append(r)
+    n = 0
+    for calls in by.values():
+        calls.sort(key=lambda r: r["ts"])
+        if any(a["ctx_tokens"] >= RESET_FLOOR and b["ctx_tokens"] < a["ctx_tokens"] * 0.5 for a, b in zip(calls, calls[1:])):
+            n += 1
+    return n
+
+
+def compute(rows, now):
+    day = local_day(now)
+    week_cut = now - 7 * 86400
+    week = [r for r in rows if r["ts"] >= week_cut]
+    today = [r for r in week if local_day(r["ts"]) == day]
+    main = collections.defaultdict(list)
+    roles = collections.defaultdict(lambda: {"calls": 0, "tokens": 0})
+    for r in week:
+        if r["kind"] == "main":
+            main[r["project"]].append(r["ctx_tokens"])
+        x = roles[r["agent_type"]]
+        x["calls"] += 1
+        x["tokens"] += r["ctx_tokens"] + r["output"]
+    pj = {}
+    for name, rs in (("today", today), ("week", week)):
+        for r in rs:
+            x = pj.setdefault(r["project"], {"today": 0, "week": 0})
+            x[name] += r["ctx_tokens"] + r["output"]
+    return {"version": 1, "generated_at": int(now), "day": day,
+            "note": "tokens = fresh + cache write + cache read + output (cache reads included); over 200k = a call whose context is 200k or more",
+            "today": block(today), "week": block(week),
+            "avg_main_context_by_project": {p: round(sum(v) / len(v)) for p, v in sorted(main.items(), key=lambda kv: -sum(kv[1])) if v},
+            "by_project": dict(sorted(pj.items(), key=lambda kv: -kv[1]["week"])[:40]),
+            "context_resets": {"today": resets(today), "week": resets(week)},
+            "by_role": dict(sorted(roles.items(), key=lambda kv: -kv[1]["tokens"]))}
+
+
+def write_summary(state, now):
+    s = compute(read_rows(state, now - 7 * 86400), now)
+    atomic_write(os.path.join(state, "ledger.summary.json"), json.dumps(s, separators=(",", ":")))
+    return s
+
+
+def fmt(n):
+    return "%.1fM" % (n / 1e6) if n >= 1e6 else "%dk" % round(n / 1e3) if n >= 1e3 else str(n)
+
+
+def words(s):
+    t, w = s["today"], s["week"]
+    L = ["Today: %s tokens (incl. cache reads), %d calls; %s%% of calls over 200k context" % (fmt(t["tokens"]), t["calls"], t["share_calls_over_200k_pct"]),
+         "7 days: %s tokens (incl. cache reads), %d calls; %s%% of calls and %s%% of tokens over 200k context" % (
+             fmt(w["tokens"]), w["calls"], w["share_calls_over_200k_pct"], w["share_tokens_over_200k_pct"]),
+         "Context resets (compact or fresh chat): today %d, 7 days %d" % (s["context_resets"]["today"], s["context_resets"]["week"])]
+    L += ["Average main-chat context: " + ", ".join("%s %s" % (p, fmt(v)) for p, v in list(s["avg_main_context_by_project"].items())[:8])]
+    L += ["Per role (7 days): " + ", ".join("%s %s" % (p, fmt(v["tokens"])) for p, v in list(s["by_role"].items())[:8])]
+    return "\n".join(L)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--update", action="store_true")
+    ap.add_argument("--summary", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--state")
+    ap.add_argument("--projects")
+    ap.add_argument("--now", type=float)
+    a = ap.parse_args(argv)
+    state, root, now = state_dir(a.state), projects_dir(a.projects), a.now or time.time()
+    if a.update or not (a.summary or a.json):
+        try:
+            r = update(state, root, now)
+        except Exception as e:                            # never leave the caller (the guard) with a traceback
+            sys.stderr.write("shipm-ledger: update failed: %s\n" % e)
+            return 1
+        if not (a.summary or a.json):
+            print("ledger: %d new rows%s" % (r["rows"], " (another run is active)" if r["busy"] else ""))
+    s = load_json(os.path.join(state, "ledger.summary.json"), {})
+    if a.json:
+        print(json.dumps(s, indent=1))
+    elif a.summary:
+        print(words(s) if s else "no ledger yet: run shipm-ledger --update")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

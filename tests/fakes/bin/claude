@@ -1,0 +1,9 @@
+#!/bin/sh
+# fake external tool for the shipm init/uninstall tests: logs its argv to $SHIPMIRACLE_FAKE_LOG; state files live in $SHIPMIRACLE_FAKE_DIR. Shell builtins only.
+N=${0##*/}
+[ -n "$SHIPMIRACLE_FAKE_LOG" ] && printf "%s\n" "$N $*" >> "$SHIPMIRACLE_FAKE_LOG"
+case "$1" in
+  --version) echo "2.1.0 (Claude Code)"; exit 0 ;;
+  auth) [ -e "$SHIPMIRACLE_FAKE_DIR/claude-logged-in" ] && exit 0; exit 1 ;;
+esac
+exit 0

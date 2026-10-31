@@ -1,0 +1,5 @@
+#!/bin/sh
+# fake external tool for the shipm init/uninstall tests: logs its argv to $SHIPMIRACLE_FAKE_LOG; state files live in $SHIPMIRACLE_FAKE_DIR. Shell builtins only.
+N=${0##*/}
+[ -n "$SHIPMIRACLE_FAKE_LOG" ] && printf "%s\n" "$N $*" >> "$SHIPMIRACLE_FAKE_LOG"
+case "$1" in -v|--version) echo "${SHIPMIRACLE_FAKE_NODE_VERSION:-v20.11.0}"; exit 0 ;; esac; exit 0

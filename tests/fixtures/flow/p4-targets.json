@@ -1,0 +1,6 @@
+{
+ "_comment": "P4 T8: new gate-controlled paths. {WS} = workspace folder, {STATE} = state folder (placeholders filled by tests/flow_gate_p4_test.py)",
+ "protected": ["{WS}/hooks/shipm-hook", "{WS}/shipmiracle/hooks/core.py", "{WS}/shipmiracle/hooks/brand_new_module.py", "{WS}/shipmiracle/hooks/__init__.py", "{STATE}/v1/pyc/core.cpython-39.pyc", "{STATE}/v1/pyc/sub/x.pyc"],
+ "bash_writes": ["echo x > '{T}'", "cp /tmp/x '{T}'", "rm '{T}'", "sed -i '' s/a/b/ '{T}'", "mv /tmp/x '{T}'", "tee '{T}' < /tmp/x", "python3 -c \"open('{T}','w').write('x')\""],
+ "harmless": ["cat {WS}/hooks/shipm-hook {WS}/shipmiracle/hooks/core.py", "ls {WS}/shipmiracle/hooks {STATE}/v1/pyc", "grep -n def {WS}/shipmiracle/hooks/core.py", "python3 -m py_compile src/app.py", "git status --short", "echo hello > /tmp/p4-harmless.txt"]
+}

@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+"""shipm-guard — keeps the Mac working while VS Code has work, hands work off before the battery dies.
+
+  shipm-guard run            loop (started at login by launchd)
+  shipm-guard once [--dry]   one decision, printed as JSON (--dry: change nothing)
+  shipm-guard install|uninstall   launchd agent com.shipmiracle.guard
+  shipm-guard on|off|status       the switch (file ~/.local/state/shipmiracle/guard.off)
+  shipm-guard hold 90m|2h|until HH:MM   keep the Mac awake until a hard end time (max 24 h, exit 2 beyond); release = shipm-guard release (both owner-only: refused inside a Claude chat)
+  shipm-guard admin-setup    prints the one-time admin command (sudo <this folder>/bin/shipm-guard-admin: pmset disablesleep / lowpowermode only)
+
+"Work" = VS Code is running AND (a Claude run is working, a subagent runs,
+or a process under VS Code's terminals uses CPU). It stays "work" for 10 min after the last sign. Work from other apps is ignored.
+Awake: caffeinate -i -s (display may sleep) + pmset disablesleep (lid closed keeps running; needs the admin step).
+Low Power Mode: only on battery, only while you are away (lid closed / idle 15 min); off at once when you are back; your own setting restored.
+Battery: <=25% unplugged -> "wrap up" flag Claude's hooks pass on; <=15% -> checkpoint on branch wip/battery-<date> (never main), then let the Mac sleep.
+Ledger: bin/shipm-ledger --update every 10 min in the background (token ledger for the panel).
+CI: while VS Code runs, bin/ci-status every 10 min in the background (red run on main -> chip on the card, warning in doctor).
+Away: lid closed or idle 15 min -> ~/.local/state/shipmiracle/away.json (keep-going.sh lets Claude take its recommended safe option).
+Reload: `run` re-executes itself (same pid, caffeinate kept, no sleep gap) when its own file changed and the new file compiles; code_started in guard.json.
+Network: one events.log line per internet outage (start, end, gap seconds); no network name is ever read or logged.
+Tests: SHIPMIRACLE_GUARD_FAKE=<json file> overrides readings; SHIPMIRACLE_STATE=<dir> moves the state dir."""
+import datetime, hashlib, json, os, pathlib, pwd, re, shlex, shutil, signal, subprocess, sys, tempfile, time
+
+# The Shipmiracle package is optional here: a broken or missing package must never crash-loop this KeepAlive daemon.
+# On any failure Shipmiracle features are off (no mirror, no config) and the old inline behaviour is used.
+try:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    from shipmiracle import config as shipmiracle_config, state as shipmiracle_state
+except BaseException as _e:     # SyntaxError, ImportError, anything: stay alive
+    if isinstance(_e, KeyboardInterrupt):
+        raise
+    shipmiracle_config = shipmiracle_state = None
+
+HOME = pathlib.Path.home()
+STATE = pathlib.Path(os.environ.get("SHIPMIRACLE_STATE", HOME / ".local/state/shipmiracle"))
+FAKE = os.environ.get("SHIPMIRACLE_GUARD_FAKE")
+WS = pathlib.Path(os.environ.get("SHIPMIRACLE_WS", pathlib.Path(__file__).resolve().parent.parent))
+HOLD = 600            # seconds work stays "work" after the last sign
+AWAY_IDLE = 900       # seconds without input = away
+HOLD_RELEASE = 30 * 60   # all working chats frozen this long (shipm-watch) -> release the awake hold
+MAX_WORK = 12 * 3600  # one unbroken stretch longer than this is released (stuck state)
+PCT_WRAP, PCT_CUT = 25, 15
+DRY = False
+PMSET = "/usr/bin/pmset"
+
+
+def sh(cmd, timeout=8):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def jread(p, default=None):
+    try:
+        return json.loads(pathlib.Path(p).read_text())
+    except Exception:
+        return default
+
+
+def jwrite(p, obj):
+    p = pathlib.Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    tmp.replace(p)
+
+
+def jwrite_mirrored(name, obj):
+    """The legacy atomic write first (unchanged), then the never-raising v1 copy."""
+    jwrite(STATE / name, obj)
+    if shipmiracle_state:
+        try:
+            shipmiracle_state.mirror(name, obj, "shipmiracle-guard", base=STATE)
+        except Exception:
+            pass
+
+
+def notify(title, msg):
+    """System notifications are off unless prefs.notify is system, or (unset) config/notifications.json says {"mac": true} (the owner does not want health or failure pop-ups)."""
+    if DRY or FAKE:
+        return
+    try:
+        from shipmiracle import platform as shipmiracle_platform
+        shipmiracle_platform.notify(title, msg, ws=WS)
+    except Exception:
+        pass
+
+
+# ---------- events log, code reload, manual hold, network outages ----------
+def evlog(msg):
+    """One line in events.log. A failing log must never stop the loop; the reason goes to stderr (guard.log)."""
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(STATE / "events.log", "a") as ef:
+            ef.write(f"{time.strftime('%F %T')} {msg}\n")
+    except OSError as e:
+        print(f"shipm-guard: events.log not written: {e!r}", file=sys.stderr)
+
+
+SELF = pathlib.Path(__file__).resolve()
+CARRY_ENV = "SHIPMIRACLE_GUARD_CARRY"      # state handed to the re-executed process (JSON)
+
+
+def file_sha(p):
+    try:
+        return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
+CODE_SHA = file_sha(SELF)
+CODE_STARTED = {"sha": CODE_SHA, "ts": int(time.time())}      # guard.json code_started: which code this process runs, since when
+_RELOAD = {"sig": None, "bad": None}
+
+
+def compiles(data):
+    """(ok, message): does `python3 -m py_compile` accept these bytes? Works on a private copy so no .pyc lands next to bin/."""
+    d = tempfile.mkdtemp(prefix="shipm-guard-")
+    try:
+        f = os.path.join(d, "shipm_guard_new.py")
+        with open(f, "wb") as fh:
+            fh.write(data)
+        r = subprocess.run([sys.executable, "-m", "py_compile", f], capture_output=True, text=True, timeout=30)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()[-300:]
+    except Exception as e:
+        return False, repr(e)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+RELOAD_SETTLE = 1.0          # a changed file must look the same (mtime + size) on two checks this many seconds apart before it is loaded
+_settle_sleep = time.sleep   # the tests replace this to write the file during the wait
+
+
+def reload_check(guard):
+    """Own file changed, stayed unchanged for RELOAD_SETTLE seconds (no half-written file) and the new one compiles -> re-exec in place
+    (os.execv keeps the pid, so `caffeinate -w pid` keeps running and the sleep block is never lifted). A file that does not compile is
+    not loaded and is logged once. Returns a word for the tests."""
+    try:
+        st = SELF.stat()
+    except OSError:
+        return "missing"
+    sig = (st.st_mtime_ns, st.st_size)
+    if sig == _RELOAD["sig"]:
+        return "same"
+    _settle_sleep(RELOAD_SETTLE)
+    try:
+        st2 = SELF.stat()
+    except OSError:
+        return "missing"
+    if (st2.st_mtime_ns, st2.st_size) != sig:
+        return "unstable"       # still being written: not remembered, the next loop looks again
+    _RELOAD["sig"] = sig
+    try:
+        data = SELF.read_bytes()
+    except OSError:
+        return "missing"
+    sha = hashlib.sha256(data).hexdigest()[:12]
+    if sha == CODE_SHA:
+        return "same"
+    if sha == _RELOAD["bad"]:
+        return "bad"
+    ok, msg = compiles(data)
+    if not ok:
+        _RELOAD["bad"] = sha
+        evlog(f"reload skipped: new shipm-guard {sha} does not compile, still running {CODE_SHA}: {msg.splitlines()[-1] if msg else '?'}")
+        return "bad"
+    evlog(f"reload pid={os.getpid()} {CODE_SHA} -> {sha}")
+    os.environ[CARRY_ENV] = json.dumps(guard.carry())
+    try:
+        os.execv(sys.executable, [sys.executable, str(SELF), "run", "--reloaded"])
+    except OSError as e:
+        os.environ.pop(CARRY_ENV, None)
+        _RELOAD["bad"] = sha
+        evlog(f"reload failed: {e!r}")
+        return "failed"
+    return "reloading"          # only reached when execv is stubbed
+
+
+def startup_reset(guard, reloaded):
+    """Watchdog: a previous crash must not leave the sleep block on. Not after a reload (same process, the block is deliberate and must not flicker)."""
+    if reloaded:
+        return False
+    if re.search(r"SleepDisabled\s+1", sh([PMSET, "-g"])):
+        guard.sudo_pmset("-a", "disablesleep", "0")
+        return True
+    return False
+
+
+HOLD_MAX = 24 * 3600      # a manual hold ends at a hard time, at most this far away
+
+
+def parse_hold(args, now):
+    """['90m'] | ['2h'] | ['until', 'HH:MM'] | ['until HH:MM'] -> (end epoch, 'HH:MM'). ValueError with a plain message otherwise (CLI exit 2)."""
+    text = " ".join(args).strip().lower()
+    m = re.fullmatch(r"(\d{1,5})\s*([mh])", text)
+    if m:
+        secs = int(m.group(1)) * (60 if m.group(2) == "m" else 3600)
+        if secs <= 0:
+            raise ValueError("the hold must be longer than zero")
+        until = int(now) + secs
+    else:
+        m = re.fullmatch(r"until\s+(\d{1,2}):(\d{2})", text)
+        if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            raise ValueError("use: hold 90m | hold 2h | hold until HH:MM")
+        dt = datetime.datetime.fromtimestamp(now).replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        if dt.timestamp() <= now:
+            dt += datetime.timedelta(days=1)
+        until = int(dt.timestamp())
+    if until - int(now) > HOLD_MAX:
+        raise ValueError("a manual hold is at most 24 hours")
+    return until, time.strftime("%H:%M", time.localtime(until))
+
+
+def manual_until(now):
+    """(end epoch, 'HH:MM') while a manual hold is active, else None. An expired, malformed or longer-than-24h file is removed (fail closed)."""
+    f = STATE / "guard.hold"
+    if not f.exists():
+        return None
+    d = jread(f, None)
+    # hand-edited files must not beat the 24 h cap: the length, the set time (not in the future) and the end (at most 24 h from now) are all checked
+    ok = (isinstance(d, dict) and all(isinstance(d.get(k), int) and not isinstance(d.get(k), bool) for k in ("until", "set"))
+          and d["until"] - d["set"] <= HOLD_MAX + 60 and d["set"] <= now + 60 and d["until"] - now <= HOLD_MAX + 60)
+    if ok and d["until"] > now:
+        return d["until"], time.strftime("%H:%M", time.localtime(d["until"]))
+    if not DRY:
+        f.unlink(missing_ok=True)
+        evlog("manual hold ended" if ok else "manual hold file ignored (malformed or over the 24 h cap) and removed")
+    return None
+
+
+NET_EVERY = 30        # seconds between internet probes
+_NET = {"t": 0}
+
+
+def net_probe(now):
+    """True/False when a probe ran just now, None when it is not due (or DRY). Same check the old Wi-Fi code used: Apple's captive-portal page. It reads no network name."""
+    if DRY or now - _NET["t"] < NET_EVERY:
+        return None
+    _NET["t"] = now
+    return "Success" in sh(["/usr/bin/curl", "-s", "-m", "3", "http://captive.apple.com/hotspot-detect.html"], 6)
+
+
+class _Adopted:
+    """The caffeinate process of the previous incarnation (still our child: exec keeps the pid and its children). Same poll/terminate as Popen."""
+    def __init__(self, pid):
+        self.pid = pid
+
+    def poll(self):
+        try:
+            r = os.waitpid(self.pid, os.WNOHANG)
+            return None if r[0] == 0 else 0
+        except ChildProcessError:
+            try:
+                os.kill(self.pid, 0)
+                return None
+            except OSError:
+                return 0
+
+    def terminate(self):
+        try:
+            os.kill(self.pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+# ---------- periodic jobs in process (P4b, config guard.jobs, default off) ----------
+DAEMON = sys.argv[1:2] == ["run"]      # only the KeepAlive loop uses in-process jobs; `once` keeps the subprocess behaviour
+_JOBS = {"mod": None, "bad": False, "runner": None, "tiers": None, "sys": None}
+
+
+def jobs_enabled():
+    """True only in `shipm-guard run`, when Shipmiracle imports, config guard.jobs is on and shipmiracle.guard.jobs loads. Never raises."""
+    if not DAEMON or shipmiracle_config is None or _JOBS["bad"]:
+        return False
+    try:
+        if shipmiracle_config.get("guard.jobs") is not True:
+            return False
+        if _JOBS["mod"] is None:
+            from shipmiracle.guard import jobs as _m
+            _JOBS["mod"] = _m
+        return True
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+        _JOBS["bad"] = True
+        return False
+
+
+def _tier(name, fn):
+    """therm / notifyutil: answered from a 60 s cache when jobs are on, asked every time otherwise."""
+    if not jobs_enabled():
+        return fn()
+    if _JOBS["tiers"] is None:
+        _JOBS["tiers"] = _JOBS["mod"].TierCache()
+    return _JOBS["tiers"].get(name, fn)
+
+
+def _jobs_tick(now, only, **over):
+    """Let the scheduler start a due job (never waits, never raises: the awake decision comes after this in step())."""
+    try:
+        m = _JOBS["mod"]
+        if _JOBS["runner"] is None:
+            _JOBS["runner"] = m.Runner(m.default_jobs(WS, sys.executable), state=STATE)
+        sysd = dict(_JOBS["sys"] or {})
+        sysd.update(over)
+        _JOBS["runner"].tick(now, sysd, only)
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+
+
+# ---------- readings ----------
+def frozen_since():
+    """When shipm-watch first saw every working chat frozen (None if work is moving or the reading is older than 3 minutes)."""
+    h = jread(STATE / "health.json", {}) or {}
+    return h.get("all_work_frozen_since") if h and time.time() - h.get("ts", 0) < 180 else None
+
+
+CLAUDE_SETTINGS = pathlib.Path(os.environ.get("SHIPMIRACLE_CLAUDE_SETTINGS", HOME / ".claude/settings.json"))
+
+
+def keep_default_model():
+    """The saved default model is opusplan (Opus plans, Sonnet builds). `/model x` + Enter rewrites it; put it back and leave
+    a note for the panel. The chat where /model was used keeps its choice; only new chats return to opusplan."""
+    if os.environ.get("SHIPMIRACLE_GUARD_FAKE") and not os.environ.get("SHIPMIRACLE_CLAUDE_SETTINGS"):
+        return None                                              # tests never touch the real settings file
+    try:
+        d = json.loads(CLAUDE_SETTINGS.read_text())
+    except Exception:
+        return None
+    was = d.get("model")
+    if was == "opusplan":
+        return None
+    d["model"] = "opusplan"
+    tmp = CLAUDE_SETTINGS.with_name(".settings.shipmiracle.tmp"); tmp.write_text(json.dumps(d, indent=2) + "\n"); tmp.replace(CLAUDE_SETTINGS)
+    STATE.mkdir(parents=True, exist_ok=True)
+    (STATE / "model-reset.json").write_text(json.dumps({"ts": int(time.time()), "was": was}))
+    return was
+
+
+def read_system():
+    f = jread(FAKE, None) if FAKE else None
+    if f is not None:
+        d = {"battery_pct": 100, "on_ac": True, "lid_closed": False, "idle_s": 0, "vscode": True,
+             "hot": False, "thermal_limit": 100, "claude_working": False, "agents": 0,
+             "vscode_busy": False, "sleep_disabled": False, "lpm": False, "poke_age": 9999, "frozen_since": None}
+        d.update(f)
+        return d
+    b = sh([PMSET, "-g", "batt"])
+    m = re.search(r"(\d+)%", b)
+    ps = sh(["/bin/ps", "-axo", "pid=,ppid=,pcpu=,command="])
+    procs = []
+    for line in ps.splitlines():
+        p = line.split(None, 3)
+        if len(p) == 4 and p[0].isdigit():
+            procs.append((int(p[0]), int(p[1]), float(p[2] or 0), p[3]))
+    vscode = any("Visual Studio Code.app/Contents/MacOS" in c for _, _, _, c in procs)
+    # descendants of VS Code's terminal host that really use CPU (shells, claude itself, helpers excluded)
+    by_parent = {}
+    for pid, ppid, cpu, cmd in procs:
+        by_parent.setdefault(ppid, []).append((pid, cpu, cmd))
+    roots = [pid for pid, _, _, c in procs if "ptyHost" in c]
+    seen, stack, busy = set(), list(roots), False
+    while stack:
+        x = stack.pop()
+        for pid, cpu, cmd in by_parent.get(x, []):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            stack.append(pid)
+            base = cmd.split()[0].rsplit("/", 1)[-1].lstrip("-")
+            if base in ("zsh", "bash", "sh", "fish", "claude", "caffeinate", "ps", "lsof", "node") and cpu < 25:
+                continue
+            if cpu >= 5 and not re.search(r"shipm-guard|caffeinate| ps |lsof", cmd):
+                busy = True
+    ioreg_lid = sh(["/usr/sbin/ioreg", "-r", "-k", "AppleClamshellState", "-d", "4"])
+    idle = re.search(r'"HIDIdleTime" = (\d+)', sh(["/usr/sbin/ioreg", "-c", "IOHIDSystem"]))
+    poke = STATE / "user-active"
+    poke_age = time.time() - poke.stat().st_mtime if poke.exists() else 9999
+    therm = _tier("therm", lambda: sh([PMSET, "-g", "therm"]))
+    tl = re.search(r"CPU_Speed_Limit\s*=\s*(\d+)", therm)
+    pm = sh([PMSET, "-g"])
+    now = time.time()
+    working = False
+    for sf in STATE.glob("*.json"):
+        if sf.name.endswith(".agents.json") or sf.name in ("plan.json", "guard.json", "away.json", "usage.json", "ci.json"):
+            continue
+        s = jread(sf, {})
+        if isinstance(s, dict) and s.get("state") in ("working", "needs-input") and now - s.get("ts", 0) < (1200 if s["state"] == "working" else HOLD):
+            working = True
+    agents = 0
+    for af in STATE.glob("*.agents.json"):
+        a = jread(af, {}) or {}
+        agents += sum(1 for v in a.values() if now - v.get("started", now) < 3 * 3600)
+    res = {"battery_pct": int(m.group(1)) if m else 100, "on_ac": "AC Power" in b,
+            "lid_closed": "AppleClamshellState\" = Yes" in ioreg_lid,
+            "idle_s": int(idle.group(1)) // 10**9 if idle else 0, "vscode": vscode,
+            "thermal_limit": int(tl.group(1)) if tl else 100,
+            "claude_working": working, "agents": agents, "vscode_busy": busy,
+            "sleep_disabled": bool(re.search(r"SleepDisabled\s+1", pm)), "lpm": bool(re.search(r"lowpowermode\s+1", pm)) or _tier("lpm_notify", lambda: sh(["/usr/bin/notifyutil", "-g", "com.apple.system.lowpowermode"])).strip().endswith(" 1"),
+            "poke_age": poke_age, "frozen_since": frozen_since()}
+    _JOBS["sys"] = res          # the job scheduler reads battery / VS Code from the last reading
+    return res
+
+
+# ---------- actions ----------
+class Guard:
+    def __init__(self):
+        self.caff = None
+        self.disabled = False
+        self.lpm_set = False
+        self.lpm_before = None
+        self.last_sign = 0
+        self.stretch_start = 0
+        self.cut = False          # battery cut-off latch
+        self.wrapped = False
+        self.log = []
+        self.net = {}             # open internet outage: {"start": epoch, "fails": n}
+
+    def act(self, what):
+        self.log.append(what)
+
+    def carry(self):
+        """What the re-executed process needs so a code reload changes nothing: the live caffeinate, hold timers, battery latches, Low Power Mode bookkeeping."""
+        alive = self.caff is not None and self.caff.poll() is None
+        return {"caff": getattr(self.caff, "pid", None) if alive else None, "last_sign": self.last_sign, "stretch_start": self.stretch_start,
+                "cut": self.cut, "wrapped": self.wrapped, "lpm_set": self.lpm_set, "lpm_before": self.lpm_before}
+
+    def adopt(self, d):
+        """Take over what carry() handed over. The caffeinate is adopted only if it really is `caffeinate ... -w <our pid>`."""
+        if not isinstance(d, dict):
+            return
+        now = time.time()
+        for k in ("last_sign", "stretch_start"):
+            if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool):
+                setattr(self, k, d[k] if d[k] <= now else now)      # never later than now (NaN and inf fail the test too): a carried time must not hold the Mac awake for ever
+        for k in ("cut", "wrapped", "lpm_set"):
+            setattr(self, k, d.get(k) is True)
+        self.lpm_before = d.get("lpm_before") if isinstance(d.get("lpm_before"), bool) else None
+        pid = d.get("caff")
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1:
+            argv = sh(["/bin/ps", "-p", str(pid), "-o", "command="]).split()
+            # exact tokens: the program is caffeinate and an argument `-w` is followed by exactly our pid (not a longer number, not a substring)
+            if argv and os.path.basename(argv[0]) == "caffeinate" and any(a == "-w" and n == str(os.getpid()) for a, n in zip(argv[1:], argv[2:])):
+                self.caff = _Adopted(pid)
+
+    def net_watch(self, now, up):
+        """One events.log line per internet outage: start, end, gap seconds. up=None: no probe this time. Two failed probes in a row make an outage
+        (one blip is ignored); start = the first failed probe, end = the first good one after it (so +-NET_EVERY seconds). No network name is read."""
+        if up is None:
+            return
+        if up:
+            if self.net.get("fails", 0) >= 2:
+                st = self.net["start"]
+                evlog(f"net_outage start={time.strftime('%FT%T', time.localtime(st))} end={time.strftime('%FT%T', time.localtime(now))} gap_s={int(now - st)}")
+            self.net = {}
+        elif self.net:
+            self.net["fails"] += 1
+        else:
+            self.net = {"start": now, "fails": 1}
+
+    def sudo_pmset(self, *args):
+        if DRY or FAKE:
+            return True
+        r = subprocess.run(["/usr/bin/sudo", "-n", PMSET, *args], capture_output=True, text=True)
+        return r.returncode == 0
+
+    def awake(self, on, actual=None):
+        if actual is not None and not (DRY or FAKE):
+            self.disabled = actual                      # trust the system, not our memory (something else may have cleared it)
+        alive = self.caff and self.caff.poll() is None
+        if on and not alive:
+            self.act("caffeinate on")
+            if not (DRY or FAKE):
+                self.caff = subprocess.Popen(["/usr/bin/caffeinate", "-i", "-s", "-w", str(os.getpid())])
+            else:
+                self.caff = None
+        if not on and alive:
+            self.caff.terminate()
+            self.act("caffeinate off")
+        if on and not self.disabled:
+            if self.sudo_pmset("-a", "disablesleep", "1"):
+                self.disabled = True
+                self.act("disablesleep 1")
+            elif not getattr(self, "warned_admin", False):
+                self.warned_admin = True
+                self.act("admin step missing: lid-closed sleep not prevented (run: shipm-guard admin-setup)")
+        if not on and self.disabled:
+            if self.sudo_pmset("-a", "disablesleep", "0"):
+                self.disabled = False
+                self.act("disablesleep 0")
+
+    def lowpower(self, want, current):
+        if want and not self.lpm_set:
+            self.lpm_before = current
+            if not current and self.sudo_pmset("-b", "lowpowermode", "1"):
+                self.act("low power mode on")
+            self.lpm_set = True
+        if not want and self.lpm_set:
+            if not self.lpm_before and self.sudo_pmset("-b", "lowpowermode", "0"):
+                self.act("low power mode off")
+            self.lpm_set = False
+
+    def cleanup(self):
+        self.awake(False)
+        self.lowpower(False, False)
+
+    # ---------- decision ----------
+    def step(self):
+        now = time.time()
+        keep_default_model()
+        s = read_system()
+        off = (STATE / "guard.off").exists()
+        idle = 0 if s["poke_age"] < 30 else s["idle_s"]
+        raw = s["vscode"] and (s["claude_working"] or s["agents"] > 0 or s["vscode_busy"])
+        if raw:
+            self.last_sign = now
+            if not self.stretch_start:
+                self.stretch_start = now
+        work = raw or (s["vscode"] and now - self.last_sign < HOLD)
+        if not work:
+            self.stretch_start = 0
+        stuck = bool(self.stretch_start) and now - self.stretch_start > MAX_WORK
+        away = s["lid_closed"] or idle >= AWAY_IDLE
+        # battery
+        if s["on_ac"] or s["battery_pct"] >= PCT_WRAP + 5:
+            self.cut = False
+            self.wrapped = False
+            if not (DRY or FAKE):
+                (STATE / "handoff-now").unlink(missing_ok=True)
+        reason = "work" if work else "idle"
+        if off:
+            reason = "switched off"
+        elif stuck:
+            reason = "released: same work for 12 h"
+        elif s["thermal_limit"] < 80:
+            reason = "released: Mac is hot"
+        elif self.cut:
+            reason = "released: battery cut-off"
+        self.watch_every = 300 if (not s["on_ac"] and s["battery_pct"] < 20) else 60
+        # the watcher found that the only "work" is frozen (quiet chat, nothing using CPU) for 30 min: do not keep the Mac awake for nothing
+        fz = s.get("frozen_since")
+        frozen_only = bool(fz) and now - fz >= HOLD_RELEASE and not s["vscode_busy"]
+        if not (off or stuck or self.cut or s["thermal_limit"] < 80) and work and frozen_only:
+            reason = "released: work frozen"
+        hold = work and not (off or stuck or self.cut or s["thermal_limit"] < 80 or frozen_only)
+        # manual hold (shipm-guard hold ...): awake until a hard end time even without work. Every release above wins over it: the Off switch, a hot Mac,
+        # the battery cut-off, the 12 h stuck stretch and frozen work (the owner did not ask the hold to override those)
+        manual = manual_until(now)
+        manual_on = bool(manual) and not (off or self.cut or s["thermal_limit"] < 80 or stuck or (work and frozen_only))
+        if manual_on:
+            hold = True
+            reason = f"manual until {manual[1]}"
+        if not s["on_ac"] and (work or manual_on) and not off:
+            if s["battery_pct"] <= PCT_CUT and not self.cut:
+                if work:                    # the checkpoint (a push to wip/battery-*) only when there is work to save; a hold without work just lets the Mac sleep
+                    self.act("checkpoint")
+                    if not (DRY or FAKE):
+                        checkpoint(s)
+                    notify("Shipmiracle", f"Battery {s['battery_pct']}%: work saved to a wip/battery branch")
+                else:
+                    self.act("battery cut-off (no work: no checkpoint)")
+                self.cut = True
+                hold = False
+                manual_on = False
+                reason = "released: battery cut-off"
+            elif s["battery_pct"] <= PCT_WRAP and not self.wrapped and work:
+                self.wrapped = True
+                self.act("wrap-up flag")
+                if not (DRY or FAKE):
+                    jwrite(STATE / "handoff-now", {"pct": s["battery_pct"], "ts": int(now)})
+                notify("Shipmiracle", f"Battery {s['battery_pct']}%: Claude is asked to wrap up")
+        self.held_projects(now)
+        self.ci_check(now, s["vscode"])
+        self.ledger_check(now)
+        self.awake(hold, s["sleep_disabled"])
+        self.lowpower(hold and not s["on_ac"] and away and idle >= 20, s["lpm"])
+        # away flag for keep-going.sh
+        if not (DRY or FAKE):
+            jwrite_mirrored("away.json", {"away": bool(away and not off), "ts": int(now)})
+        if not (DRY or FAKE):
+            if hold and not off:        # the outage probe runs only while the guard is on and holding the Mac awake: never when off or idle
+                self.net_watch(now, net_probe(now))
+            else:
+                self.net = {}           # no probing, so no half-open outage is kept (its start would be stale when holding resumes)
+        sig = (s["lid_closed"], hold, self.lpm_set, self.cut, off, manual_on)
+        if sig != getattr(self, "last_sig", None) and not (DRY or FAKE):     # event log: what the guard saw and did, for checking later
+            self.last_sig = sig
+            with open(STATE / "events.log", "a") as ef:
+                ef.write(f"{time.strftime('%F %T')} lid_closed={s['lid_closed']} ac={s['on_ac']} batt={s['battery_pct']}% hold={hold} lpm={self.lpm_set} off={off} reason={reason}\n")
+        out = {"work": work, "hold": hold, "reason": reason, "away": away, "battery": s["battery_pct"], "ac": s["on_ac"],
+               "lid_closed": s["lid_closed"], "idle_s": idle, "lpm": self.lpm_set,
+               "off": off, "manual_until": manual[0] if manual else None, "pid": os.getpid(), "code_started": CODE_STARTED,
+               "actions": self.log[:], "ts": int(now)}
+        self.log.clear()
+        if not (DRY or FAKE):
+            out["on"] = not off
+            jwrite_mirrored("guard.json", out)
+        return out
+
+    def held_projects(self, now):
+        """Once a minute: periodic scans (shipm-watch, idea nudge, CI). Never blocks the loop. (The post-gate tick was removed 20 Oct 2026.)"""
+        if not (DRY or FAKE) and jobs_enabled():      # guard.jobs on: scan + nudge as in-process jobs (shipmiracle.guard.jobs)
+            return _jobs_tick(now, ("scan", "nudge"))
+        if now - getattr(self, "last_hold_check", 0) < 60 or DRY or FAKE:
+            return
+        self.last_hold_check = now
+        if now - getattr(self, "last_watch", 0) >= getattr(self, "watch_every", 60):          # frozen/stuck work, leftovers, Mac pressure -> health.json (bin/shipm-watch)
+            self.last_watch = now
+            try:
+                subprocess.run([sys.executable, str(WS / "bin/shipm-watch"), "scan"], capture_output=True, timeout=30)
+            except Exception:
+                pass
+        if now - getattr(self, "last_idea_check", 0) >= 600:          # every 10 min: ask once about ideas in idle projects (bin/idea nudge)
+            self.last_idea_check = now
+            try:
+                subprocess.run([sys.executable, str(WS / "bin/idea"), "nudge"], capture_output=True, timeout=30)
+            except Exception:
+                pass
+
+    def ci_check(self, now, vscode):
+        """Every 10 min while VS Code runs (work or not): bin/ci-status in the background, so a red GitHub Actions run on
+        main shows on the project's card. Never waits for it, never starts a second one."""
+        if not (DRY or FAKE) and jobs_enabled():      # guard.jobs on: in-process job (gh and git still spawn)
+            return _jobs_tick(now, ("ci",), vscode=vscode)
+        if not vscode or DRY or FAKE or now - getattr(self, "last_ci_check", 0) < 600:
+            return
+        proc = getattr(self, "ci_proc", None)
+        if proc and proc.poll() is None:
+            return
+        self.last_ci_check = now
+        try:
+            self.ci_proc = subprocess.Popen([sys.executable, str(WS / "bin/ci-status")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def ledger_check(self, now):
+        """Every 10 min: bin/shipm-ledger --update in the background (token ledger and ledger.summary.json for the panel). Same pattern as
+        ci_check: never waits for it, never starts a second one, no new process in between."""
+        if not (DRY or FAKE) and jobs_enabled():      # guard.jobs on: same subprocess, scheduled by shipmiracle.guard.jobs (battery-aware)
+            return _jobs_tick(now, ("ledger",))
+        if DRY or FAKE or now - getattr(self, "last_ledger_check", 0) < 600:
+            return
+        proc = getattr(self, "ledger_proc", None)
+        if proc and proc.poll() is None:
+            return
+        self.last_ledger_check = now
+        try:
+            self.ledger_proc = subprocess.Popen([sys.executable, str(WS / "bin/shipm-ledger"), "--update"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+def checkpoint(s):
+    """Write docs/CHECKPOINT.md and push the uncommitted work to wip/battery-<date> using plumbing: the working tree, HEAD and
+    the current branch are never touched, nothing goes to main."""
+    now = time.time()
+    day = time.strftime("%Y-%m-%d-%H%M")
+    for sf in STATE.glob("*.json"):
+        if sf.name.endswith(".agents.json") or sf.name in ("plan.json", "guard.json", "away.json", "ci.json"):
+            continue
+        st = jread(sf, {})
+        path = st.get("path") if isinstance(st, dict) else None
+        if not path or not pathlib.Path(path, ".git").exists() or now - st.get("ts", 0) > 4 * 3600:
+            continue
+        try:
+            g = lambda *a, env=None: subprocess.run(["git", "-C", path, *a], capture_output=True, text=True, env=env, timeout=60)
+            sess = ""
+            enc = path.replace("/", "-").replace(".", "-")
+            cands = sorted((HOME / ".claude/projects" / enc).glob("*.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+            if cands:
+                sess = cands[0].stem
+            body = (f"# CHECKPOINT — {st.get('project')}\n\nWritten automatically by shipm-guard at {time.strftime('%Y-%m-%d %H:%M')} "
+                    f"(battery {s['battery_pct']}%, unplugged). Work was running in VS Code; the Mac is about to sleep.\n\n"
+                    f"- Claude state: {st.get('state')} {st.get('message', '')}\n- Last Claude session: {sess or 'unknown'} "
+                    f"(resume: `claude --resume {sess}` or `claude --continue`)\n- Read docs/STATUS.md first; it is the handoff.\n\n"
+                    f"## git status\n```\n{g('status', '--short').stdout.strip()[:3000]}\n```\n")
+            pathlib.Path(path, "docs").mkdir(exist_ok=True)
+            pathlib.Path(path, "docs/CHECKPOINT.md").write_text(body)
+            idx = pathlib.Path(path, ".git", f"shipmiracle-index-{os.getpid()}")
+            env = dict(os.environ, GIT_INDEX_FILE=str(idx))
+            g("read-tree", "HEAD", env=env)
+            g("add", "-A", env=env)
+            for f in g("ls-files", "-z", env=env).stdout.split("\0"):
+                if not f:
+                    continue
+                full = pathlib.Path(path, f)
+                if re.search(r"(^|/)(\.env[^/]*|[^/]*\.(pem|key|p12|pfx)|id_rsa[^/]*)$", f) or (full.exists() and full.stat().st_size > 5_000_000):
+                    g("rm", "--cached", "-q", "--ignore-unmatch", "--", f, env=env)
+            tree = g("write-tree", env=env).stdout.strip()
+            idx.unlink(missing_ok=True)
+            head = g("rev-parse", "HEAD").stdout.strip()
+            commit = g("commit-tree", tree, "-p", head, "-m", f"battery checkpoint {day} (automatic, shipm-guard)").stdout.strip()
+            if commit:
+                br = f"wip/battery-{day}"
+                g("update-ref", f"refs/heads/{br}", commit)
+                g("push", "-q", "origin", f"refs/heads/{br}")
+        except Exception:
+            continue
+
+
+# ---------- commands ----------
+PLIST = HOME / "Library/LaunchAgents/com.shipmiracle.guard.plist"
+
+
+def main():
+    global DRY
+    a = sys.argv[1:] or ["status"]
+    cmd = a[0]
+    if "--dry" in a:
+        DRY = True
+    if cmd == "once":
+        print(json.dumps(Guard().step(), indent=1))
+    elif cmd == "run":
+        g = Guard()
+        STATE.mkdir(parents=True, exist_ok=True)
+        reloaded = "--reloaded" in a
+        if reloaded:
+            try:
+                g.adopt(json.loads(os.environ.pop(CARRY_ENV, "") or "{}"))
+            except ValueError as e:
+                evlog(f"reload: carried state unreadable, starting fresh: {e!r}")
+        evlog(f"guard started pid={os.getpid()} code={CODE_SHA} reloaded={reloaded}")
+        startup_reset(g, reloaded)         # not after a reload: no sleep gap
+
+        def stop(*_):
+            g.cleanup()
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, stop)
+        signal.signal(signal.SIGINT, stop)
+        poke = STATE / "user-active"
+        while True:
+            try:
+                out = g.step()
+            except Exception as e:
+                out = {"hold": False}
+                (STATE / "guard.err").write_text(repr(e))
+            wait = 5 if out.get("hold") or not out.get("lid_closed") else 15
+            if not out.get("hold") and not out.get("work"):
+                wait = 10
+            end = time.time() + wait
+            seen = poke.stat().st_mtime if poke.exists() else 0
+            while time.time() < end:
+                time.sleep(1)
+                reload_check(g)
+                if poke.exists() and poke.stat().st_mtime != seen:
+                    break
+    elif cmd in ("hold", "release") and "CLAUDECODE" in os.environ:       # Claude Code sets CLAUDECODE in its tools' environment; any value counts
+        print(f"shipm-guard {cmd}: for the owner in a terminal, not inside a Claude Code chat (CLAUDECODE is set); nothing was changed", file=sys.stderr)
+        sys.exit(2)
+    elif cmd == "hold":
+        try:
+            until, label = parse_hold([x for x in a[1:] if not x.startswith("--")], time.time())
+        except ValueError as e:
+            print(f"shipm-guard hold: {e}", file=sys.stderr)
+            sys.exit(2)
+        jwrite(STATE / "guard.hold", {"until": until, "set": int(time.time())})
+        (STATE / "user-active").touch()
+        print(f"manual hold until {label} ({(until - int(time.time())) // 60} min); undo: shipm-guard release")
+        if (STATE / "guard.off").exists():
+            print("note: the guard is OFF; the Off switch wins until you turn it on")
+    elif cmd == "release":
+        STATE.mkdir(parents=True, exist_ok=True)
+        had = (STATE / "guard.hold").exists()
+        (STATE / "guard.hold").unlink(missing_ok=True)
+        (STATE / "user-active").touch()
+        print("manual hold released" if had else "no manual hold was set")
+    elif cmd == "off":
+        STATE.mkdir(parents=True, exist_ok=True)
+        (STATE / "guard.off").write_text("off")
+        (STATE / "user-active").touch()
+        print("guard OFF")
+    elif cmd == "on":
+        (STATE / "guard.off").unlink(missing_ok=True)
+        (STATE / "user-active").touch()
+        print("guard ON")
+    elif cmd == "status":
+        st = jread(STATE / "guard.json", {})
+        st = st or {"on": not (STATE / "guard.off").exists(), "note": "guard has not run yet"}
+        m = manual_until(time.time())       # read from the hold file, not the last guard.json, so a hold set a second ago shows
+        st["manual_until"] = m[0] if m else None
+        if m:
+            st["manual"] = f"manual until {m[1]}"
+        print(json.dumps(st, indent=1))
+    elif cmd == "install":
+        PLIST.parent.mkdir(parents=True, exist_ok=True)
+        PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.shipmiracle.guard</string>
+<key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>{WS}/bin/shipm-guard</string><string>run</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardErrorPath</key><string>{STATE}/guard.log</string><key>StandardOutPath</key><string>{STATE}/guard.log</string>
+</dict></plist>""")
+        uid = str(os.getuid())
+        sh(["/bin/launchctl", "bootout", f"gui/{uid}", str(PLIST)])
+        print(sh(["/bin/launchctl", "bootstrap", f"gui/{uid}", str(PLIST)]) or "installed and started")
+    elif cmd == "uninstall":
+        sh(["/bin/launchctl", "bootout", f"gui/{os.getuid()}", str(PLIST)])
+        PLIST.unlink(missing_ok=True)
+        sh(["/usr/bin/sudo", "-n", PMSET, "-a", "disablesleep", "0"])
+        print("guard removed (delete /etc/sudoers.d/shipm-guard too if you no longer want the admin line)")
+    elif cmd == "admin-setup":
+        u = pwd.getpwuid(os.getuid()).pw_name
+        if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", u):
+            sys.exit("shipm-guard: this account name is not valid for a sudoers rule")
+        line = (f"{u} ALL=(root) NOPASSWD: {PMSET} -a disablesleep 1, {PMSET} -a disablesleep 0, "
+                f"{PMSET} -b lowpowermode 1, {PMSET} -b lowpowermode 0")
+        # the helper writes the rule through a private mktemp file, validates it with visudo and installs it (no predictable /tmp path)
+        print("Run this once (paste into the VS Code prompt after '!'):\n")
+        print(f"sudo {shlex.quote(str(SELF.parent / 'shipm-guard-admin'))}\n")
+        print(f"It installs exactly this rule in /etc/sudoers.d/shipm-guard:\n{line}")
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

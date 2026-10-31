@@ -1,0 +1,26 @@
+# Release notes template for GitHub's "Generate release notes" button. Write the sections below by hand for each release:
+# what is new, what was fixed, what changed (read before updating), the support level, what was verified and what was not.
+changelog:
+  exclude:
+    labels:
+      - duplicate
+      - wontfix
+  categories:
+    - title: Changed (read before updating)
+      labels:
+        - breaking
+    - title: Safety
+      labels:
+        - safety
+    - title: New
+      labels:
+        - enhancement
+    - title: Fixed
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - docs
+    - title: Other
+      labels:
+        - "*"

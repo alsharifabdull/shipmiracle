@@ -1,0 +1,242 @@
+{
+  "env": {
+    "BASH_DEFAULT_TIMEOUT_MS": "600000",
+    "BASH_MAX_TIMEOUT_MS": "3600000",
+    "AGENT_BROWSER_ARGS": "--use-mock-keychain,--password-store=basic"
+  },
+  "model": "opusplan",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/keep-awake.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/guard-hook.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/plan-approval.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/flow-gate.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/keep-awake.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/guard-hook.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/plan-approval.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/agent-cap.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "ExitPlanMode|Edit|Write|NotebookEdit|MultiEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/flow-gate.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/keep-going.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/flow-gate.sh"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/limit-wait.sh"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/agent-state.sh"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/agent-state.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/flow-gate.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/plan-approval.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/AI-Workspace/hooks/flow-gate.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "$HOME/Developer/AI-Workspace/hooks/plan-capture.sh",
+    "padding": 0
+  },
+  "enabledPlugins": {
+    "commit-commands@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true,
+    "pr-review-toolkit@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "feature-dev@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "swift-lsp@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "frontend-design@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "playwright@claude-plugins-official": false
+  },
+  "extraKnownMarketplaces": {
+    "anthropic-agent-skills": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/skills"
+      }
+    }
+  },
+  "theme": "light",
+  "remoteControlAtStartup": true,
+  "agentPushNotifEnabled": true,
+  "autoMode": {
+    "environment": [
+      "<sanitized text 0>",
+      "<sanitized text 1>",
+      "<sanitized text 2>",
+      "<sanitized text 3>",
+      "<sanitized text 4>",
+      "<sanitized text 5>",
+      "<sanitized text 6>",
+      "<sanitized text 7>",
+      "<sanitized text 8>",
+      "<sanitized text 9>",
+      "<sanitized text 10>",
+      "<sanitized text 11>",
+      "<sanitized text 12>",
+      "<sanitized text 13>",
+      "<sanitized text 14>",
+      "<sanitized text 15>",
+      "<sanitized text 16>",
+      "<sanitized text 17>",
+      "<sanitized text 18>",
+      "<sanitized text 19>",
+      "<sanitized text 20>",
+      "<sanitized text 21>",
+      "<sanitized text 22>",
+      "<sanitized text 23>",
+      "<sanitized text 24>"
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Edit(~/.claude/settings.json)",
+      "Edit(~/.claude/settings.local.json)",
+      "Edit(~/Developer/AI-Workspace/hooks/**)",
+      "Edit(~/Developer/AI-Workspace/config/flow.json)",
+      "Edit(~/Developer/AI-Workspace/config/gate-deny.off)",
+      "Edit(~/Developer/AI-Workspace/bin/gate-deny)",
+      "Edit(~/Developer/AI-Workspace/bin/shipm-chat)",
+      "Edit(~/Developer/*/.claude/settings.json)",
+      "Edit(~/Developer/*/.claude/settings.local.json)",
+      "Edit(~/Developer/*/.claude/hooks/**)",
+      "Edit(~/.local/state/shipmiracle/*)"
+    ]
+  }
+}

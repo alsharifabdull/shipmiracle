@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# daily — the scheduled maintenance run (launchd, every day 09:00; also runnable by hand).
+# Updates Claude plugins, approved skills, VS Code extensions; runs doctor; lists
+# agent promotion candidates; writes $STATE/v1/logs/daily-<date>.log (private, 0600) and shows a macOS notification.
+# Never edits project source or commits project files.
+set -uo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# logdir-begin (tests/daily_test.py runs these lines; SHIPMIRACLE_STATE is honoured only with SHIPMIRACLE_TEST=1, like shipmiracle/paths.py)
+if [[ "${SHIPMIRACLE_TEST:-}" == 1 && -n "${SHIPMIRACLE_STATE:-}" ]]; then STATE="$SHIPMIRACLE_STATE"; else STATE="$HOME/.local/state/shipmiracle"; fi
+LOGDIR="$STATE/v1/logs"; log=""; LOGFAIL=0
+mkdir -p "${STATE%/*}" 2>/dev/null   # parents of the state folder (normally ~/.local/state); the state folder and below are created 0700 one level at a time
+for d in "$STATE" "$STATE/v1" "$LOGDIR"; do [[ -L "${d%/*}" && "$d" != "$STATE" ]] && break; [[ -e "$d" || -L "$d" ]] || mkdir -m 700 "$d" 2>/dev/null; done   # never create anything through a symlink
+# a symlinked or unwritable log folder is refused: fall back to reports/ in the workspace, never skip the maintenance run
+if [[ -d "$LOGDIR" && ! -L "$LOGDIR" && ! -L "$STATE/v1" && -w "$LOGDIR" ]]; then chmod 700 "$LOGDIR" 2>/dev/null
+  # launchd creates launchd-daily.log (StandardOutPath) itself with mode 644 whatever the umask: tighten it here, never through a symlink
+  [[ -f "$LOGDIR/launchd-daily.log" && ! -L "$LOGDIR/launchd-daily.log" ]] && chmod 600 "$LOGDIR/launchd-daily.log" 2>/dev/null
+else LOGDIR="$WS/reports"; mkdir -p "$LOGDIR" 2>/dev/null; fi
+log="$LOGDIR/daily-$(date +%Y-%m-%d).log"
+( umask 077; : > "$log" ) 2>/dev/null || { log=/dev/null; LOGFAIL=1; }   # no place to write: still run everything, say so instead of "0 problems"
+# logdir-end
+{
+  echo "Shipmiracle daily — $(date '+%Y-%m-%d %H:%M')"
+  echo; echo "== Claude plugins"; "$WS/bin/plugins-update"
+  echo; echo "== Skills (approved list + updates)"; "$WS/bin/skills-sync" --diff   # offline: reads the cache; nothing updates. --online only by hand or from a weekly job
+  echo; echo "== Skills and plugins found, not approved"; sf=$("$WS/bin/shipm" skills found --short 2>&1 </dev/null); sfrc=$?   # fail-soft: a missing subcommand is one note line, never an abort
+  if [[ $sfrc -eq 0 ]]; then printf '%s\n' "$sf" | head -20; else echo "  note: 'shipm skills found --short' not available (exit $sfrc); skipped"; fi
+  echo; echo "== VS Code extensions"; code --update-extensions 2>&1 | tail -5
+  echo; echo "== Agent promotion candidates"
+  # fail-soft and bounded: ONE counter run behind the same kind of watchdog as the Tidy step (own process group, killed at the limit; SHIPMIRACLE_COUNTER_LIMIT only with
+  # SHIPMIRACLE_TEST=1). Its output is captured, printed ONLY when it exited 0, and the words FAIL/warn in it are broken, so data can never change the Health counts below.
+  climit=60; [[ "${SHIPMIRACLE_TEST:-}" == 1 && "${SHIPMIRACLE_COUNTER_LIMIT:-}" =~ ^[0-9.]+$ ]] && climit="$SHIPMIRACLE_COUNTER_LIMIT"
+  cout=$(python3 -c 'import os,signal,subprocess,sys
+p=subprocess.Popen(sys.argv[2:],start_new_session=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,stdin=subprocess.DEVNULL)
+try:
+    o=p.communicate(timeout=float(sys.argv[1]))[0]
+except subprocess.TimeoutExpired:
+    os.killpg(p.pid,signal.SIGKILL); p.communicate(); sys.exit(124)
+sys.stdout.write(o.decode("utf-8","replace")); sys.exit(p.returncode)' "$climit" "$WS/bin/promote-agent" --report 2>/dev/null); crc=$?
+  if [[ $crc -eq 0 ]]; then printf '%s\n' "$cout" | sed -E 's/([Ff])([Aa][Ii][Ll])/\1*\2/g; s/([Ww])([Aa][Rr][Nn])/\1*\2/g'
+  elif [[ $crc -eq 124 ]]; then echo "candidate list timed out after ${climit} s (nothing else is affected)"
+  else echo "candidate list unavailable (the counter failed; nothing else is affected)"; fi
+  echo; echo "== Team flow (7 days)"; python3 "$WS/bin/flow-report" 7
+  echo; echo "== Report digest (shipm report digest --write; fail-soft)"; "$WS/bin/shipm" report digest --write || echo "report digest failed (exit $?): the other steps still ran"
+  echo; echo "== Native deny rules (repair a stripped rule)"; "$WS/bin/gate-deny" install --auto
+  echo; echo "== Tidy (weekly, read-only; fail-soft; sizes and counts only, no file names)"
+  "$WS/bin/shipm-watch" host --heavy-ok >/dev/null 2>&1; hrc=$?
+  if [[ $hrc -eq 0 ]]; then
+    # hard wall clock (default 420 s; SHIPMIRACLE_TIDY_LIMIT only with SHIPMIRACLE_TEST=1): a project on a hung disk cannot stall the daily run before Health
+    tlimit=420; [[ "${SHIPMIRACLE_TEST:-}" == 1 && "${SHIPMIRACLE_TIDY_LIMIT:-}" =~ ^[0-9.]+$ ]] && tlimit="$SHIPMIRACLE_TIDY_LIMIT"
+    python3 -c 'import os,signal,subprocess,sys
+p=subprocess.Popen(sys.argv[2:],start_new_session=True)
+try:
+    sys.exit(p.wait(timeout=float(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    os.killpg(p.pid,signal.SIGKILL); p.wait(); print("tidy timed out after %d s" % float(sys.argv[1])); sys.exit(124)' "$tlimit" "$WS/bin/shipm" tidy --all --write --weekly || echo "tidy skipped or failed (exit $?): the other steps still ran"
+  elif [[ $hrc -eq 1 ]]; then echo "tidy skipped: the Mac is busy, it runs on the next daily"
+  else echo "tidy skipped: host check failed (exit $hrc), it runs on the next daily"; fi
+  echo; echo "== Health"; "$WS/bin/doctor" --full; echo "doctor exit: $?"
+} > "$log" 2>&1
+[[ $LOGFAIL -eq 1 ]] || chmod 600 "$log" 2>/dev/null
+# prune-begin (keep two weeks: the newest 14 daily-*.log in the log folder, and the same in the old reports/ folder)
+for pd in "$LOGDIR" "$WS/reports"; do ls -t "$pd"/daily-*.log 2>/dev/null | tail -n +15 | xargs rm -f 2>/dev/null; done
+# prune-end
+if [[ $LOGFAIL -eq 1 ]]; then msg="Health: unknown, the daily log could not be written (checked $STATE/v1/logs and $WS/reports)."
+else fails=$(grep -c ' FAIL ' "$log"); warns=$(grep -c ' warn ' "$log"); msg="Health: $fails problems, $warns warnings. Report: $log"; fi
+# notify-begin (the message goes in as an argument, never spliced into any script: quotes, backslashes, $(...) and newlines are shown verbatim; shipmiracle.platform decides whether to notify: prefs.notify, else the old config/notifications.json switch; off by default: the report is in the state logs folder)
+(cd "$WS" && python3 -m shipmiracle.platform notify "Shipmiracle daily" "$msg" "$WS") 2>/dev/null || true
+# notify-end
+echo "$msg"
+[[ "${1:-}" == "--show" && $LOGFAIL -eq 0 ]] && cat "$log"
+exit 0

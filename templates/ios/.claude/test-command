@@ -1,0 +1,1 @@
+swift test 2>/dev/null || xcodebuild test -scheme "$(basename "$PWD")" -destination 'platform=iOS Simulator,name=iPhone 17' -quiet

@@ -1,0 +1,15 @@
+#!/bin/sh
+# fake external tool for the shipm init/uninstall tests: logs its argv to $SHIPMIRACLE_FAKE_LOG; state files live in $SHIPMIRACLE_FAKE_DIR. Shell builtins only.
+N=${0##*/}
+[ -n "$SHIPMIRACLE_FAKE_LOG" ] && printf "%s\n" "$N $*" >> "$SHIPMIRACLE_FAKE_LOG"
+case "$1" in
+  --version) echo "git version 2.39.0 (fake)"; exit 0 ;;
+  config)
+    [ "$2" = "--global" ] || exit 1
+    case "$3" in
+      user.name)  [ -e "$SHIPMIRACLE_FAKE_DIR/git-name" ]  && { /bin/cat "$SHIPMIRACLE_FAKE_DIR/git-name"; exit 0; } ;;
+      user.email) [ -e "$SHIPMIRACLE_FAKE_DIR/git-email" ] && { /bin/cat "$SHIPMIRACLE_FAKE_DIR/git-email"; exit 0; } ;;
+    esac
+    exit 1 ;;
+esac
+exit 0

@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""shipm-timer — the Linux / WSL2 twin of the launchd daily job: a systemd USER timer (no root, your account only).
+
+  shipm-timer render [--dir D]    write the two unit files (default ~/.config/systemd/user), touch nothing else
+  shipm-timer install             render + log folder + `systemctl --user daemon-reload` + enable the timer (through shipmiracle.platform.service())
+  shipm-timer remove              disable the timer, delete the two unit files (only if they are still exactly ours), daemon-reload
+  shipm-timer status              loaded / not loaded
+
+Units come from templates/systemd/*.in (placeholders @WS@ @STATE@). Values are checked and escaped for systemd (% and $ doubled; a newline,
+quote or backslash in a path is refused). A unit file that exists and differs is never overwritten. Without systemd (macOS, containers, some WSL2)
+install/remove/status print one line and exit 3 with nothing written. Test seams: SHIPMIRACLE_TEST=1 + SHIPMIRACLE_SETUP_BIN (fake systemctl), SHIPMIRACLE_FAKE_OS / SHIPMIRACLE_FAKE_PROC."""
+import os, sys
+from pathlib import Path
+
+WS = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(WS))
+from shipmiracle import timer  # noqa: E402
+LABEL, SUFFIXES = timer.LABEL, timer.SUFFIXES
+
+
+def esc(value):
+    return timer.esc(value)
+
+
+def render(name, ws=WS, state=None):
+    return timer.render(name, ws, state)
+
+
+def unit_dir(arg=None):
+    return timer.unit_dir(arg)
+
+
+def write_units(d):
+    """Returns (written, problem). Never replaces a file that differs."""
+    return timer.write_units(d, WS)
+
+
+def main(argv):
+    cmd = argv[0] if argv else ""
+    if cmd not in ("render", "install", "remove", "status"):
+        sys.stderr.write(__doc__.split("\n\n")[0] + "\n")
+        return 2
+    dirarg = argv[argv.index("--dir") + 1] if "--dir" in argv and argv.index("--dir") + 1 < len(argv) else None
+    try:
+        if cmd == "render":
+            w, problem = write_units(unit_dir(dirarg))
+            print(problem or ("wrote: " + (", ".join(w) or "nothing new (already current)")))
+            return 1 if problem else 0
+        from shipmiracle import platform, setup
+        svc = platform.service()
+        if svc.name != "systemd":
+            print("no systemd user manager here: nothing done. Run `shipm daily` (bin/daily) by hand or from the panel.")
+            return 3
+        d = unit_dir(dirarg)
+        if cmd == "status":
+            print("loaded" if svc.is_loaded(LABEL) else "not loaded")
+            return 0
+        if cmd == "install":
+            from shipmiracle import state
+            state.ensure_dir(state.ensure_root() / "logs")      # systemd opens the log file before bin/daily runs
+            w, problem = write_units(d)
+            if problem:
+                print(problem)
+                return 1
+            setup.call("systemctl", ["--user", "daemon-reload"])
+            rc, err = svc.load(LABEL, d / (LABEL + ".timer"))
+            print("timer enabled (daily 09:00)" if rc == 0 else "systemctl enable failed (exit %d): %s" % (rc, err.strip()[:200]))
+            return 0 if rc == 0 else 1
+        rc, err = svc.unload(LABEL)                     # remove
+        for s in SUFFIXES:
+            p = d / (LABEL + s)
+            try:
+                if p.is_file() and not p.is_symlink() and p.read_bytes() == render(LABEL + s):
+                    p.unlink()
+            except OSError:
+                pass
+        setup.call("systemctl", ["--user", "daemon-reload"])
+        print("timer disabled and unit files removed" if rc == 0 else "disable returned exit %d (unit files removed if they were still ours)" % rc)
+        return 0
+    except (ValueError, OSError) as e:
+        print("shipm-timer: %s" % e, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

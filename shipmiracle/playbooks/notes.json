@@ -1,0 +1,62 @@
+{
+ "agents": {
+  "design": "designer",
+  "do": "builder",
+  "plan": "planner",
+  "review": "reviewer",
+  "scope": "scoper",
+  "verify": "verifier"
+ },
+ "checks": [
+  "file saved",
+  "links"
+ ],
+ "dep_files": [],
+ "fast_limit": {
+  "max_files": 5,
+  "max_lines": null
+ },
+ "labels": {
+  "approve": "OK",
+  "deliver": "File",
+  "do": "Write",
+  "intake": "Request",
+  "learn": "Learn",
+  "plan": "Plan",
+  "review": "Review",
+  "scope": "Scope",
+  "verify": "Check"
+ },
+ "lane": {
+  "default": "fast",
+  "fast_allowed": true
+ },
+ "review": {
+  "always": [],
+  "full": [],
+  "on_risk": [],
+  "on_ui": []
+ },
+ "risk_paths_default": [],
+ "roles": {
+  "approve": "owner",
+  "deliver": "lead",
+  "do": "build",
+  "learn": "lead",
+  "plan": "plan",
+  "review": "review",
+  "scope": "scope",
+  "verify": "test"
+ },
+ "skips": {
+  "fast": [
+   "scope",
+   "plan",
+   "approve",
+   "review"
+  ]
+ },
+ "type": "notes",
+ "ui_paths": [],
+ "v": 1
+}

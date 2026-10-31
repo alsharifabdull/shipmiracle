@@ -1,0 +1,3 @@
+{"session_id": "SESSION", "transcript_path": "~/.claude/projects/P/SESSION.jsonl", "cwd": "PROJECT", "prompt_id": "pr1", "permission_mode": "default",
+ "agent_id": "agent-a1", "agent_type": "qa-engineer", "effort": {"level": "medium"}, "hook_event_name": "SubagentStop", "stop_hook_active": false,
+ "agent_transcript_path": "~/.claude/projects/P/SESSION/subagents/agent-a1.jsonl", "last_assistant_message": "", "background_tasks": [], "session_crons": []}

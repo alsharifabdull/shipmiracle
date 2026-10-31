@@ -1,0 +1,23 @@
+#!/usr/bin/env -S python3 -IS
+"""shipm: thin launcher for the Shipmiracle command line; the logic is in shipmiracle/cli.py (stdlib only, Python 3.9)."""
+from __future__ import annotations
+
+import os
+import sys
+
+if os.name == "nt":      # native Windows: Shipmiracle needs a POSIX system (pwd, fcntl, /bin/sh); refuse in one line before any Shipmiracle import
+    sys.stderr.write('Shipmiracle does not run on native Windows yet. Use WSL 2: run "wsl --install", open Ubuntu, then install Shipmiracle there. Nothing was changed.\n')
+    sys.exit(2)
+if not sys.executable:
+    sys.stderr.write("shipm: cannot find the python program that runs it; nothing was changed.\n")
+    sys.exit(2)
+if not (sys.flags.isolated and sys.flags.no_site):      # D14 m7/#8: normally the shebang above (`env -S python3 -IS`) already runs isolated: no PYTHONPATH, no sitecustomize, no user site, no working folder on the path. Started as `python3 bin/shipm` (flags missing) it re-runs itself that way; a sitecustomize found through PYTHONPATH has then already run ONCE (before this line), see DECISIONS
+    os.execv(sys.executable, [sys.executable, "-I", "-S"] + sum(((["-X", k + "=" + v] if v is not True else ["-X", k]) for k, v in sys._xoptions.items()), []) + [os.path.realpath(__file__)] + sys.argv[1:])
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))      # append: a stray module named like a stdlib module in the checkout must not shadow it; `shipmiracle` is found here because nothing else on the isolated path has that name
+from shipmiracle.cli import main  # noqa: E402
+
+for _s in (sys.stdout, sys.stderr):          # -I drops PYTHONIOENCODING / PYTHONUTF8: an unencodable character must not crash a message
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(errors="backslashreplace")
+
+sys.exit(main())

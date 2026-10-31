@@ -1,0 +1,5 @@
+#!/bin/sh
+# fake external tool for the shipm init/uninstall tests: logs its argv to $SHIPMIRACLE_FAKE_LOG; state files live in $SHIPMIRACLE_FAKE_DIR. Shell builtins only.
+N=${0##*/}
+[ -n "$SHIPMIRACLE_FAKE_LOG" ] && printf "%s\n" "$N $*" >> "$SHIPMIRACLE_FAKE_LOG"
+case "$1" in -un) echo tester ;; -u) echo 501 ;; *) echo "uid=501(tester)" ;; esac; exit 0

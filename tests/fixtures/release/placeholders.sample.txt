@@ -1,0 +1,9 @@
+# home-folder names that are allowed in the public tree
+x
+example
+someone
+you
+a.b
+some.other-user
+<owner>
+$USER

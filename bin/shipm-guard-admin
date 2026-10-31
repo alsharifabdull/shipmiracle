@@ -1,0 +1,32 @@
+#!/bin/sh
+# shipm-guard-admin — run ONCE with: sudo <engine folder>/bin/shipm-guard-admin   (<engine folder> = config engine.dir, the folder you cloned Shipmiracle into)
+# Lets the invoking admin user (SUDO_USER) run exactly four pmset commands without a password (lid-closed keep-awake and Low Power Mode for shipm-guard).
+# Nothing else is allowed. Undo: sudo rm /etc/sudoers.d/shipm-guard
+# shipm-guard-admin --print [USER]  prints the sudoers line (USER defaults to the calling account) and writes nothing; no root needed.
+set -e
+P=/usr/bin/pmset
+rule() { printf '%s ALL=(root) NOPASSWD: %s -a disablesleep 1, %s -a disablesleep 0, %s -b lowpowermode 1, %s -b lowpowermode 0\n' "$1" "$P" "$P" "$P" "$P"; }
+valid() {
+  case $1 in *'
+'*) return 1 ;; esac      # a newline would pass grep line by line and inject a second sudoers line
+  [ "$1" != root ] && printf '%s' "$1" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$'
+}
+if [ "${1:-}" = "--print" ]; then
+  U=${2-$(id -un)}
+  valid "$U" || { echo "shipm-guard-admin: refusing user name '$U'" >&2; exit 1; }
+  rule "$U"
+  exit 0
+fi
+[ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+U=${SUDO_USER:?run with sudo from your own account (SUDO_USER is not set)}
+valid "$U" || { echo "shipm-guard-admin: refusing user name '$U' (root or not a normal account name)" >&2; exit 1; }
+T=$(mktemp)
+rule "$U" > "$T"
+visudo -cf "$T"
+mkdir -p /etc/sudoers.d
+chmod 755 /etc/sudoers.d
+install -m 440 -o root -g wheel "$T" /etc/sudoers.d/shipm-guard
+rm -f "$T"
+grep -Eq '^[#@]includedir[[:space:]]+/(private/)?etc/sudoers.d' /etc/sudoers && echo "include line present" || echo "WARNING: /etc/sudoers does not include sudoers.d, so the rule below would have no effect; do not continue. Skip this optional step or ask someone who knows sudo"
+visudo -c
+echo OK

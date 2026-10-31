@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Pre-push (workspace): secret scan of the refs being pushed (gitleaks, brew install gitleaks). A finding (or a scanner error) refuses the push, so a manual
+# git push after a post-commit block cannot publish the secret. Missing gitleaks: warn, allow. Override: git push --no-verify (say why).
+# COMPOSABLE: stdin (the ref lines) is read once into $refs and $1 is the remote name; every guard is its own marked block below and refuses with exit 1.
+# Another guard (e.g. the release guard) appends its own block after the GITLEAKS-PREPUSH-END marker and may reuse $remote_name and $refs.
+remote_name=${1:-}; refs=$(cat)
+#--GITLEAKS-PREPUSH-BEGIN--
+if command -v gitleaks >/dev/null 2>&1; then
+  while read -r lref lsha rref rsha; do
+    [[ -n "${lsha:-}" ]] || continue
+    [[ "$lsha" =~ ^0+$ ]] && continue   # deleting a ref pushes no commits
+    opts="$lsha --not --remotes=$remote_name"
+    if [[ -n "${rsha:-}" && ! "$rsha" =~ ^0+$ ]] && git cat-file -e "$rsha^{commit}" 2>/dev/null; then opts="$opts $rsha"; fi
+    if ! gitleaks detect --log-opts="$opts" --redact --no-banner >&2; then
+      echo "push blocked: gitleaks finding in the commits being pushed to ${rref:-$lref} (see above). Remove the secret from the history, or override with git push --no-verify (say why)." >&2; exit 1
+    fi
+  done <<< "$refs"
+else
+  echo "gitleaks not installed: pre-push secret scan skipped (brew install gitleaks)" >&2
+fi
+#--GITLEAKS-PREPUSH-END--
+#--RELEASE-PREPUSH-BEGIN--
+# Release guard (P8): `shipm push-check` applies the registry rules offline (a project pushes only to its own remote; the public remote only
+# from the export stage with a fresh release-check stamp). Exit 1 refuses; any other result (Shipmiracle missing, an old Shipmiracle without push-check) warns and allows.
+# Engine lookup: $SHIPMIRACLE_ENGINE, shipm on PATH, ~/.local/bin/shipm, then this checkout when it is the engine itself. Override: git push --no-verify (say why).
+shipmiracle_bin=""; top=$(git rev-parse --show-toplevel 2>/dev/null)
+for c in "${SHIPMIRACLE_ENGINE:+$SHIPMIRACLE_ENGINE/bin/shipm}" "$(command -v shipm 2>/dev/null)" "$HOME/.local/bin/shipm" "${top:+$top/bin/shipm}"; do
+  [[ -n "$c" && -f "$c" && -x "$c" ]] && { shipmiracle_bin=$c; break; }
+done
+if [[ -n "$shipmiracle_bin" ]]; then
+  printf '%s\n' "$refs" | "$shipmiracle_bin" push-check "${1:-}" "${2:-}"; rc=$?
+  if [[ $rc -eq 1 ]]; then exit 1; elif [[ $rc -ne 0 ]]; then echo "shipm push-check exited $rc: release push guard skipped" >&2; fi
+else
+  echo "Shipmiracle not found: release push guard skipped (set SHIPMIRACLE_ENGINE or install shipm)" >&2
+fi
+#--RELEASE-PREPUSH-END--
+exit 0

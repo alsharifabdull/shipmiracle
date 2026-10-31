@@ -1,0 +1,7 @@
+# One maintainer owns everything. The login was set to alsharifabdull on 27 Oct 2026.
+# The repository is a one-way export, so this file mostly documents who reviews changes before they are ported by hand.
+*                  @alsharifabdull
+/shipmiracle/      @alsharifabdull
+/hooks/            @alsharifabdull
+/tests/            @alsharifabdull
+/.github/          @alsharifabdull

@@ -1,0 +1,63 @@
+{
+ "agents": {
+  "design": "designer",
+  "do": "builder",
+  "plan": "planner",
+  "review": "reviewer",
+  "scope": "scoper",
+  "verify": "verifier"
+ },
+ "checks": [
+  "dry-run output",
+  "rollback tested",
+  "health check"
+ ],
+ "dep_files": [],
+ "fast_limit": null,
+ "labels": {
+  "approve": "OK",
+  "deliver": "Apply",
+  "do": "Change",
+  "intake": "Request",
+  "learn": "Learn",
+  "plan": "Plan",
+  "review": "Review",
+  "scope": "Scope",
+  "verify": "Dry-run"
+ },
+ "lane": {
+  "default": "full",
+  "fast_allowed": false
+ },
+ "review": {
+  "always": [
+   "correctness",
+   "risk"
+  ],
+  "full": [],
+  "on_risk": [],
+  "on_ui": []
+ },
+ "risk_paths_default": [],
+ "roles": {
+  "approve": "owner",
+  "deliver": "lead",
+  "do": "build",
+  "learn": "lead",
+  "plan": "plan",
+  "review": "review",
+  "scope": "scope",
+  "verify": "test"
+ },
+ "skips": {
+  "fast": [
+   "scope",
+   "plan",
+   "approve",
+   "review"
+  ]
+ },
+ "type": "ops",
+ "ui_paths": [],
+ "v": 1
+}

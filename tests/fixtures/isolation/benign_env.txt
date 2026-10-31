@@ -1,0 +1,53 @@
+# G11 benign corpus 2: everyday commands in a project that HAS a .env (gitignored), a .gitignore, node_modules and a venv. Every line must NOT be refused by the isolation rule.
+rg TODO
+rg -n "api_key" src
+rg --hidden -g '!.env' TODO
+git grep -n TODO
+git grep -n -i api_key -- src
+git grep TODO -- '*.ts'
+grep -rn foo src
+grep -rn -i api_key --exclude=.env* .
+grep -rn -i api_key --exclude='.env*' --exclude-dir=node_modules .
+grep -rn TODO src docs
+find . -maxdepth 1 -name ".*" -type f
+find src -name ".*" -prune -o -type f -print
+find . -name "*.ts" -not -path "./node_modules/*"
+find . -type f -name "*.py" | head -20
+ls -a
+ls -la
+tree -L 2 -I node_modules
+cat .env.example
+cat package.json
+cat README.md
+git status
+git diff
+git log --oneline -5
+git add src/a.ts
+git commit -m "feat: read the API key from the environment (see .env.example)"
+npm test
+npm run build
+npm install lodash
+npm install --save-dev typescript
+npm i github:user/repo
+curl -s https://example.com -o /tmp/out.json
+curl -sS -X POST https://api.example.com/v1 -H 'Content-Type: application/json' -d '{"a":1,"b":2,"c":3}'
+kubectl patch deployment app -p '{"spec":{"replicas":2,"paused":false}}'
+node -e 'const o={a:1,b:2}; console.log(o)'
+echo '{"x":1,"y":2}' | jq .
+docker compose up -d
+docker compose --env-file .env up
+docker run --rm -v $PWD:/app node:20 npm test
+docker run --rm -v ./src:/app/src node:20 ls /app/src
+python3 -m pytest -q
+source .env && npm run dev
+set -a; source .env; set +a; npm run dev
+echo done
+cp -r src /tmp/g11-src-copy
+mkdir -p build/out && cp src/a.ts build/out/
+touch src/new.ts
+rm -rf build
+sed -i.bak 's/foo/bar/' src/a.ts
+diff -r src /tmp/g11-src-copy
+tar czf /tmp/g11-src.tgz src
+wc -l src/a.ts
+head -20 src/a.ts

@@ -1,0 +1,9 @@
+[Unit]
+Description=Shipmiracle daily maintenance, every day at 09:00 (a run missed while the computer was off happens at the next start)
+
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

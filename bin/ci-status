@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""ci-status — latest GitHub Actions run on main for every project, written to ~/.local/state/shipmiracle/ci.json.
+
+  ci-status            check every ~/Developer/<project> that has a git remote and .github/workflows
+  ci-status --print    also print the file
+
+ci.json: {"<project>": {"conclusion","status","title","url","at"(run start),"checked_at"(last attempt),"last_ok"[,"error","stale"]}}.
+"stale": true = error and the last good check is over 30 min old (or unknown): show "CI status unknown", not the old result. The panel shows a red chip, bin/doctor a warning.
+If gh fails (or is missing) the old entry is kept, "error" added, checked_at updated. No token is ever read or printed.
+Tests: SHIPMIRACLE_GH=<command> replaces gh; SHIPMIRACLE_STATE=<dir> moves the state dir; SHIPMIRACLE_DEV=<dir> moves ~/Developer."""
+import datetime, json, os, pathlib, re, shlex, shutil, subprocess, sys
+
+# The Shipmiracle package is optional: if it cannot be imported the old inline discovery and no mirror are used.
+try:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    from shipmiracle import projects as shipmiracle_projects, state as shipmiracle_state
+except BaseException as _e:
+    if isinstance(_e, KeyboardInterrupt):
+        raise
+    shipmiracle_projects = shipmiracle_state = None
+
+HOME = pathlib.Path.home()
+STATE = pathlib.Path(os.environ.get("SHIPMIRACLE_STATE", HOME / ".local/state/shipmiracle"))
+DEV = pathlib.Path(os.environ.get("SHIPMIRACLE_DEV", HOME / "Developer"))
+STALE_S = 30 * 60
+NO_GH = "gh not found: install it or add it to PATH"
+
+
+def find_gh():
+    """gh by bare name fails under launchd (minimal PATH): search the usual install dirs first. SHIPMIRACLE_GH (tests) wins;
+    SHIPMIRACLE_GH_PATHS (tests) replaces the extra dirs. Falls back to the bare name."""
+    if os.environ.get("SHIPMIRACLE_GH"):
+        return shlex.split(os.environ["SHIPMIRACLE_GH"])
+    extra = os.environ.get("SHIPMIRACLE_GH_PATHS") or "/opt/homebrew/bin:/usr/local/bin:" + str(HOME / ".local/bin")
+    found = shutil.which("gh", path=extra + os.pathsep + os.environ.get("PATH", ""))
+    return [found] if found else ["gh"]
+
+
+GH = find_gh()
+FIELDS = "conclusion,status,displayTitle,url,createdAt"
+
+
+def jread(p, default):
+    try:
+        return json.loads(pathlib.Path(p).read_text())
+    except Exception:
+        return default
+
+
+def jwrite(p, obj):
+    p = pathlib.Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj))
+    tmp.replace(p)
+
+
+def folders():
+    """Project folders: the shared resolver, else the old directory listing."""
+    if shipmiracle_projects:
+        try:
+            return [pathlib.Path(p.path) for p in shipmiracle_projects.list_projects(dev=DEV)]
+        except Exception:
+            pass
+    return sorted(DEV.iterdir()) if DEV.is_dir() else []
+
+
+def repo_of(folder):
+    """owner/name from the origin URL (https or ssh), or None."""
+    try:
+        r = subprocess.run(["git", "-C", str(folder), "remote", "get-url", "origin"], capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?\s*$", r.stdout.strip())
+    return m.group(1) if m else None
+
+
+def latest_run(repo):
+    r = subprocess.run([*GH, "run", "list", "--repo", repo, "--branch", "main", "--limit", "1", "--json", FIELDS],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError("gh exited %d" % r.returncode)
+    runs = json.loads(r.stdout or "[]")
+    if not runs:
+        return {"conclusion": "", "status": "none", "title": "", "url": "", "at": ""}
+    x = runs[0]
+    return {"conclusion": x.get("conclusion") or "", "status": x.get("status") or "", "title": x.get("displayTitle") or "",
+            "url": x.get("url") or "", "at": x.get("createdAt") or ""}
+
+
+def older_than(iso, now):
+    """True when iso (the last successful check) is missing, unreadable or more than STALE_S old."""
+    try:
+        return (now - datetime.datetime.fromisoformat(iso)).total_seconds() > STALE_S
+    except Exception:
+        return True
+
+
+def main(argv=None):
+    """argv=None: the command line; argv=[] (the guard's in-process job) prints nothing."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    old = jread(STATE / "ci.json", {})
+    if not isinstance(old, dict):
+        old = {}
+    out = {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stamp = now.isoformat(timespec="seconds")
+    for folder in folders():
+        if folder.name.startswith(".") or not (folder / ".github/workflows").is_dir():
+            continue
+        repo = repo_of(folder)
+        if not repo:
+            continue
+        try:
+            out[folder.name] = latest_run(repo)
+        except Exception as e:                      # keep the old entry; the message never contains gh's output
+            prev = old.get(folder.name) if isinstance(old.get(folder.name), dict) else {}
+            msg = NO_GH if isinstance(e, FileNotFoundError) else type(e).__name__ + ": " + str(e)[:80]
+            last_ok = prev.get("last_ok") or ("" if prev.get("error") else prev.get("checked_at") or "")
+            out[folder.name] = {**prev, "error": msg, "checked_at": stamp, "last_ok": last_ok, "stale": older_than(last_ok, now)}
+            continue
+        out[folder.name]["checked_at"] = stamp
+        out[folder.name]["last_ok"] = stamp
+    jwrite(STATE / "ci.json", out)
+    if shipmiracle_state:
+        try:
+            shipmiracle_state.mirror("ci.json", out, "ci-status", base=STATE)
+        except Exception:               # a partly broken Shipmiracle package must never break the check
+            pass
+    if "--print" in argv:
+        print(json.dumps(out, indent=1))
+
+
+if __name__ == "__main__":
+    main()

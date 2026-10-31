@@ -1,0 +1,432 @@
+#!/usr/bin/env bash
+# doctor: is the workspace healthy? Exit 1 and name every problem; never fix silently.
+#   bin/doctor          fast mode (default, a few seconds): every cheap check; independent checks run in parallel.
+#   bin/doctor --full   everything: also the embedded test suites, logins (claude, gh), MCP connect, promotion candidates, session-brief sizes.
+# A check that fast mode skips is printed as "  info not checked in fast mode ..." (never ok, never dropped); the last line says how many.
+set -uo pipefail
+WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FULL=0
+for a in "$@"; do case "$a" in --full) FULL=1 ;; -h|--help) echo "usage: bin/doctor [--full]   (default: fast mode; --full also runs the slow checks)"; exit 0 ;; *) echo "doctor: unknown option $a (usage: bin/doctor [--full])" >&2; exit 2 ;; esac; done
+export WS
+fail=0; SK=0; ok() { printf '  ok   %s\n' "$1"; }; bad() { printf '  FAIL %s\n' "$1"; fail=1; }; warn() { printf '  warn %s\n' "$1"; }
+skipped() { SK=$((SK+1)); printf '  info not checked in fast mode (run bin/doctor --full): %s\n' "$1"; }
+
+# ---- parallel prefetch: slow independent checks start now, their results are read where the row is printed (order of rows unchanged)
+T="$(mktemp -d "${TMPDIR:-/tmp}/shipmiracle-doctor.XXXXXX")"; trap 'wait; rm -rf "$T"' EXIT
+bg() { local n=$1; shift; ( "$@" > "$T/$n.tmp" 2>&1; echo $? > "$T/$n.rc"; mv "$T/$n.tmp" "$T/$n" ) & }
+await() { until [[ -e "$T/$1" ]]; do sleep 0.05; done; }     # result file of a bg job
+rcof() { await "$1"; cat "$T/$1.rc"; }
+out() { await "$1"; cat "$T/$1"; }
+# trow KEY OKMSG BADMSG prints the row of one embedded test suite (full mode only; fast mode says it was not checked)
+trow() { if [[ $FULL -eq 0 ]]; then skipped "$2"; return; fi; await "t.$1"; [[ "$(cat "$T/t.$1")" == 0 ]] && ok "$2" || bad "$3"; }
+lane() { ( for spec in "$@"; do k=${spec%%:*}; f=${spec#*:}; case "$f" in *.js) i=node ;; *) i=python3 ;; esac
+    [[ -f "$WS/tests/$f" ]] || { echo 1 > "$T/t.$k"; continue; }; "$i" "$WS/tests/$f" >/dev/null 2>&1; echo $? > "$T/t.$k.tmp"; mv "$T/t.$k.tmp" "$T/t.$k"; done ) & }
+
+projcheck() {  # one project under ~/Developer: prints its rows (runs in a background subshell; FAIL rows are counted from the output)
+  local p=$1 n ahead dirty hp sz bs; n=$(basename "$p")
+  [[ -d "$p/.git" ]] || { warn "$n: not a git repo"; return 0; }
+  (cd "$p" && git remote get-url origin >/dev/null 2>&1) || { warn "$n: no GitHub remote"; return 0; }
+  ahead=$(cd "$p" && git rev-list --count '@{u}..HEAD' 2>/dev/null || echo "?")
+  dirty=$(cd "$p" && git status --porcelain | wc -l | tr -d ' ')
+  [[ -f "$p/.git/PUSH-FAILED" ]] && bad "$n: auto-push failed at $(cat "$p/.git/PUSH-FAILED") → cd $p && git push"
+  [[ "$ahead" == 0 && "$dirty" == 0 ]] && ok "$n pushed and clean" || warn "$n: $ahead commits not on GitHub, $dirty uncommitted files"
+  [[ -f "$p/AGENTS.md" ]] || grep -q "SHIPMIRACLE-STANDARD BEGIN" "$p/CLAUDE.md" 2>/dev/null || return 0   # template project: managed block in CLAUDE.md, or the old AGENTS.md
+  (cd "$p" && git ls-files --error-unmatch ':(icase)docs/STATUS.md' >/dev/null 2>&1) || { warn "$n: not on the template yet (docs/STATUS.md not committed; migration branch unmerged)"; return 0; }
+  hp=$(cd "$p" && git config core.hooksPath 2>/dev/null); [[ "$hp" == .githooks && -x "$p/.githooks/post-commit" ]] || bad "$n: auto-push hook not installed → apply-template $p"
+  [[ -x "$p/.claude/hooks/session-start.sh" ]] || bad "$n: session-start hook missing → apply-template $p"
+  grep -q '"autoMemoryDirectory"' "$p/.claude/settings.json" 2>/dev/null || bad "$n: memory not in repo (autoMemoryDirectory) → apply-template $p"
+  [[ -d "$p/docs/memory" ]] && (cd "$p" && git ls-files --error-unmatch ':(icase)docs/memory/MEMORY.md' >/dev/null 2>&1) && ok "$n: memory in repo" || warn "$n: docs/memory not committed yet"
+  grep -qE "^Updated: *$(date +%Y-%m)" "$p/docs/STATUS.md" 2>/dev/null || warn "$n: docs/STATUS.md not updated this month"
+  sz=$(wc -c < "$p/docs/STATUS.md" 2>/dev/null | tr -d ' '); [[ "${sz:-0}" -gt 25000 ]] && warn "$n: docs/STATUS.md is $((sz/1024)) KB → bin/status-trim $p (older entries go to docs/status-archive/, nothing is deleted)"
+  if [[ $FULL -eq 1 ]]; then
+    bs=$(cd "$p" && CLAUDE_PROJECT_DIR="$p" bash .claude/hooks/session-start.sh </dev/null 2>/dev/null | wc -c | tr -d ' '); [[ "${bs:-0}" -gt 8000 ]] && warn "$n: session brief is $((bs/1024)) KB (Claude Code cuts hook output near 10 KB)"
+  fi
+  return 0
+}
+agentcheck_all() { { "$WS/bin/agent-check" "$WS"/agents/claude/*.md; for p in "$HOME"/Developer/*/.claude/agents; do [[ -d "$p" ]] && "$WS/bin/agent-check" "$p"/*.md; done; } 2>/dev/null | sed "s#$HOME/Developer/##"; }
+promote_count() { "$WS/bin/promote-agent" --candidates 2>/dev/null | grep -cE 'in [0-9]+ projects|called [0-9]+x'; }
+claude_login() { claude auth status 2>/dev/null | grep -qi 'loggedIn.*true'; }
+claude_mcp() { claude mcp list 2>/dev/null | grep -q 'Connected'; }
+gate_deny_check() { "$WS/bin/gate-deny" check 2>&1; }
+
+command -v code >/dev/null && bg ext bash -c 'code --list-extensions 2>/dev/null'
+bg agentchk agentcheck_all
+[[ -f "$WS/config/gate-deny.off" ]] || bg gdeny gate_deny_check
+PROJS=(); for p in "$HOME"/Developer/*/; do
+  p=${p%/}; [[ -d "$p" && ! -L "$p" ]] || continue; [[ "$(basename "$p")" == AI-Workspace ]] && continue
+  PROJS+=("$p"); bg "proj.${#PROJS[@]}" projcheck "$p"
+done
+if [[ $FULL -eq 1 ]]; then
+  command -v claude >/dev/null && { bg claude_login claude_login; bg claude_mcp claude_mcp; }
+  bg gh_login bash -c 'gh auth status >/dev/null 2>&1'
+  bg promote promote_count
+  # five lanes of test suites in parallel; the four browser suites share /tmp files and Chrome ports, so they stay in one lane
+  lane watch:watch_test.py
+  lane flow_gate:flow_gate_test.py flow_gate_bash:flow_gate_bash_test.py health_contract:health_contract_test.py
+  lane guard:guard_test.py ci_status:ci_status_test.py away:away_decisions_test.py notif:notifications_test.py idea:idea_test.py status_trim:status_trim_test.py bg_cap:bg_cap_test.py health_replay:health_replay_test.py
+  lane panel:panel_test.js ext_ideas:ext_ideas_test.js health_panel:health_panel_test.js chat_health:chat_health_test.js ext_health_fix:ext_health_fix_test.js
+  lane health_ui:health_ui_test.js panel_ui:panel_ui_test.js panel_align:panel_align_test.js panel_scroll:panel_scroll_test.js
+fi
+[[ $FULL -eq 1 ]] && echo "doctor: full mode (every check)" || echo "doctor: fast mode (slow checks are listed as 'not checked'; bin/doctor --full runs them all)"
+
+echo "Tools"
+for t in claude gh code git; do command -v "$t" >/dev/null && ok "$t $(command -v "$t")" || bad "$t missing"; done
+[[ -d "/Applications/Visual Studio Code.app" ]] && ok "VS Code app" || bad "VS Code app missing"
+
+echo "Logins (no credentials read)"
+if [[ $FULL -eq 0 ]]; then skipped "Claude Code signed in"; skipped "GitHub CLI signed in"
+else
+  if command -v claude >/dev/null; then [[ "$(rcof claude_login)" == 0 ]] && ok "Claude Code signed in" || bad "Claude Code not signed in → run: claude auth login"; else bad "Claude Code not signed in → run: claude auth login"; fi
+  [[ "$(rcof gh_login)" == 0 ]] && ok "GitHub CLI signed in" || bad "GitHub CLI not signed in → run: gh auth login"
+fi
+
+echo "VS Code extensions"
+if command -v code >/dev/null; then
+  exts=$(out ext)
+  for e in anthropic.claude-code github.vscode-pull-request-github eamodio.gitlens shipmiracle.shipmiracle-panel usernamehw.errorlens editorconfig.editorconfig streetsidesoftware.code-spell-checker github.vscode-github-actions dbaeumer.vscode-eslint esbenp.prettier-vscode ms-python.python ms-python.vscode-pylance charliermarsh.ruff swiftlang.swift-vscode; do
+    grep -qx "$e" <<<"$exts" && ok "$e" || bad "$e missing → code --install-extension $e"
+  done
+fi
+
+echo "Claude: MCP and model"
+if command -v claude >/dev/null; then
+  if [[ $FULL -eq 0 ]]; then skipped "MCP servers connect"
+  elif [[ "$(rcof claude_mcp)" == 0 ]]; then ok "MCP servers connect"
+  else warn "no MCP server reported Connected (check: claude mcp list)"
+  fi
+fi
+s="$HOME/.claude/settings.json"
+grep -q '"model": *"opusplan"' "$s" 2>/dev/null && ok "default model opusplan" || warn "default model is not opusplan (a /model in some chat changed it) → sync-tools resets"
+# remote-begin
+# Remote Control: on = ok; off = ok (public default; opt in: shipm init --step remote-control). Never a warn or FAIL, no dotfiles lookup.
+if grep -q '"remoteControlAtStartup": *true' "$s" 2>/dev/null; then ok "Remote Control on at startup"
+else ok "Remote Control off (default; opt in with: shipm init --step remote-control)"; fi
+# Owner check (Touch ID / Mac password / typed code): only the escalating autopilot commands (start, check-in, admit, allow, resume, drop) ask for it; autopilot is off by default. Never a FAIL.
+orow=$(python3 "$WS/bin/shipm" owner status --line 2>/dev/null </dev/null); if [[ -n "$orow" ]]; then [[ "${orow%%$'\t'*}" == ok ]] && ok "${orow#*$'\t'}" || warn "${orow#*$'\t'}"; fi
+# WSL: Shipmiracle's files and your projects must live in the Linux file system (on /mnt/c the 0600 file modes and case-sensitive path checks do not hold)
+# wslmounts-begin
+if [[ -e "${SHIPMIRACLE_DOCTOR_WSLFILE:-/proc/sys/fs/binfmt_misc/WSLInterop}" ]]; then
+  for d in "$HOME/.config/shipmiracle" "$HOME/.local/state/shipmiracle" "$HOME/Developer"; do
+    [[ -e "$d" ]] || continue; rp=$(cd "$d" 2>/dev/null && pwd -P); mt=$(awk -v p="$rp" '$2==substr(p,1,length($2)) && ($3=="9p"||$3=="drvfs") {print $2}' "${SHIPMIRACLE_DOCTOR_MOUNTS:-/proc/mounts}" 2>/dev/null | head -1)
+    [[ -n "$mt" ]] && bad "WSL: $d is on the Windows disk ($mt): keep Shipmiracle and your projects inside the Linux file system (/home/...), file modes (0600) and case-sensitive path checks do not hold there"
+  done
+fi
+# wslmounts-end
+# remote-end
+
+echo "Global Claude hooks"
+# hooks-begin (dispatcher v1: every event of table T in hooks/shipm-hook, plus StatusLine, must be registered as `hooks/shipm-hook <Event>`; legacy: the old scripts)
+HOOKMODE=$(python3 "$WS/bin/shipm" config get hooks.dispatcher 2>/dev/null </dev/null | head -1)
+if [[ "$HOOKMODE" == v1 ]]; then
+  while IFS=$'\t' read -r st ev; do
+    if [[ "$st" == ok ]]; then ok "hook $ev registered (shipm-hook)"; else bad "hook $ev not registered in ~/.claude/settings.json → shipm sync --repair-hooks"; fi
+  done < <(python3 -I - "$WS/hooks/shipm-hook" "$HOME/.claude/settings.json" <<'PYEOF'
+import ast, json, re, sys
+try: T = ast.literal_eval(re.search(r"^T = (\{.*\})\s*$", open(sys.argv[1]).read(), re.M).group(1))
+except Exception as e: print("bad\t(table T unreadable: %s)" % type(e).__name__); sys.exit(0)
+try: d = json.load(open(sys.argv[2]))
+except Exception: d = {}
+if not isinstance(d, dict): d = {}
+def cmds(ev):
+    out = []
+    sl = d.get("statusLine")
+    if ev == "StatusLine" and isinstance(sl, dict): out.append(str(sl.get("command", "")))
+    h = d.get("hooks"); h = h.get(ev) if isinstance(h, dict) else None
+    for g in (h if isinstance(h, list) else []):
+        for x in (g.get("hooks", []) if isinstance(g, dict) else []):
+            if isinstance(x, dict): out.append(str(x.get("command", "")))
+    return out
+for ev in sorted(set(T) | {"StatusLine"}):
+    print(("ok" if any(re.search(r"hooks/shipm-hook\s+" + ev + r"(?![A-Za-z])", c) for c in cmds(ev)) else "bad") + "\t" + ev)
+PYEOF
+)
+else
+  for h in keep-awake guard-hook plan-approval keep-going limit-wait agent-state; do grep -q "AI-Workspace/hooks/$h.sh" "$HOME/.claude/settings.json" 2>/dev/null && ok "global hook $h" || bad "global hook $h missing → sync-tools"; done
+fi
+# hooks-end
+
+echo "Awake guard"
+if [[ -e "$HOME/.local/state/shipmiracle/guard.off" ]]; then warn "awake guard is switched OFF (panel button or: bin/shipm-guard on)"; else ok "awake guard switch is on"; fi
+launchctl list 2>/dev/null | grep com.shipmiracle.guard >/dev/null && ok "guard agent loaded" || warn "guard agent not loaded → bin/shipm-guard install"
+sudo -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1 && ok "admin step done (lid-closed keep-awake works)" || warn "admin step missing: lid-closed keep-awake off → bin/shipm-guard admin-setup"   # read-only probe: sudo -n -l only asks whether the rule is allowed; it never runs pmset
+# 30 Oct 2026: guard rows that read ~/.local/state/shipmiracle/guard.json and events.log READ-ONLY (never write, never act); every field is optional (a missing or odd field = no row, never a FAIL).
+# Row 1: guard.json code_started.sha vs sha256 of bin/shipm-guard. Row 2: pmset -g says SleepDisabled 1 while guard.json hold is false for > 5 min (since = time of the last events.log line). Row 3: manual_until in the future. Row 4: last network outage
+# (events.log line net_outage start=... end=... gap_s=N written when an outage ends; only the start and the length are shown, never a network name). tests/doctor_guard_test.py runs the lines between the markers.
+# guardrows-begin
+gr_pm=$(pmset -g 2>/dev/null </dev/null)
+# the Python program sits in a variable first: a heredoc inside <( ) breaks bash 3.2 when the text holds a lone ) or a quote
+IFS= read -r -d '' GR_PY <<'PYEOF'
+import hashlib, json, re, sys, time
+state, guard_file, pmset_out = sys.argv[1], sys.argv[2], sys.argv[3]
+now = time.time()
+def jload(p):
+    try:
+        d = json.load(open(p))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+g = jload(state + "/guard.json")
+def stamp(line):   # events.log line = "YYYY-MM-DD HH:MM:SS key=value ..." (local time)
+    try: return time.mktime(time.strptime(line[:19], "%Y-%m-%d %H:%M:%S"))
+    except Exception: return None
+try: ev = [(stamp(l), l) for l in open(state + "/events.log", errors="replace").read().splitlines()]
+except Exception: ev = []
+ev = [(t, l) for t, l in ev if t is not None]
+# 1) running older code than bin/shipm-guard
+cs = g.get("code_started")
+sha = cs.get("sha") if isinstance(cs, dict) else None
+if isinstance(sha, str) and len(sha) >= 7:
+    try: want = hashlib.sha256(open(guard_file, "rb").read()).hexdigest()
+    except Exception: want = None
+    if want:
+        if want.startswith(sha.lower()) or sha.lower().startswith(want):
+            print("ok\tguard is running the current bin/shipm-guard")
+        else:
+            print("warn\tguard is running older code than bin/shipm-guard → it reloads itself within a few seconds; if it stays: launchctl kickstart -k gui/$(id -u)/com.shipmiracle.guard")
+# 2) sleep disabled but the guard is not holding
+if re.search(r"^\s*SleepDisabled\s+1\b", pmset_out, re.M) and g.get("hold") is False:
+    hold_lines = [(t, l) for t, l in ev if re.search(r"\bhold=(True|False)\b", l)]
+    if hold_lines and "hold=False" in hold_lines[-1][1] and now - hold_lines[-1][0] > 300:
+        print("warn\tsleep is disabled but the guard is not holding → shipm-guard off then on")
+# 3) manual hold
+mu = g.get("manual_until")
+if mu is None: mu = jload(state + "/guard.hold").get("until")   # the same hold as the guard keeps it in its state file
+t = None
+if isinstance(mu, bool): pass
+elif isinstance(mu, (int, float)): t = mu / 1000 if mu > 1e11 else mu
+elif isinstance(mu, str):
+    try:
+        t = float(mu)
+    except ValueError:
+        try: t = time.mktime(time.strptime(mu[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S"))
+        except Exception: t = None
+if t is not None and t > now:
+    print("info\tmanual hold until " + time.strftime("%H:%M", time.localtime(t)))
+# 4) last network outage: the guard writes one line when an outage ENDS: "<ts> net_outage start=<YYYY-MM-DDTHH:MM:SS> end=<...> gap_s=N"
+out = [m for m in (re.search(r"\bnet_outage start=(\d{4}-\d\d-\d\d)T(\d\d:\d\d):\d\d\b.*?\bgap_s=(\d+)\b", l) for t, l in ev) if m]
+if out:
+    d, hm, gap = out[-1].group(1), out[-1].group(2), int(out[-1].group(3))
+    print("info\tlast network outage " + d + " " + hm + " for " + (("%d s" % gap) if gap < 90 else ("%d min" % round(gap / 60)) if gap < 5400 else ("%.1f h" % (gap / 3600))))
+PYEOF
+while IFS=$'\t' read -r gr_kind gr_msg; do
+  case "$gr_kind" in ok) ok "$gr_msg" ;; warn) warn "$gr_msg" ;; info) printf '  info %s\n' "$gr_msg" ;; esac
+done < <(python3 -I -c "$GR_PY" "${SHIPMIRACLE_STATE:-$HOME/.local/state/shipmiracle}" "$WS/bin/shipm-guard" "$gr_pm" 2>/dev/null)
+# guardrows-end
+[[ -x "$WS/bin/shipm-chat" ]] && bash -n "$WS/bin/shipm-chat" 2>/dev/null && ok "chat launcher bin/shipm-chat is executable and valid (restarts continue the conversation)" || bad "bin/shipm-chat missing, not executable or has a syntax error → chmod +x bin/shipm-chat"
+trow guard "guard decision tests pass" "guard decision tests FAIL → python3 tests/guard_test.py"
+trow ci_status "ci-status tests pass" "ci-status tests FAIL → python3 tests/ci_status_test.py"
+trow away "away-decisions tests pass" "away-decisions tests FAIL → python3 tests/away_decisions_test.py"
+trow notif "notifications stay off unless switched on" "notification tests FAIL → python3 tests/notifications_test.py"
+trow idea "feature-ideas tests pass" "feature-ideas tests FAIL → python3 tests/idea_test.py"
+trow panel "panel render tests pass" "panel render tests FAIL → node tests/panel_test.js"
+trow ext_ideas "panel button tests pass" "panel button tests FAIL → node tests/ext_ideas_test.js"
+trow health_panel "health tab tests pass" "health tab tests FAIL → node tests/health_panel_test.js"
+trow health_ui "health tab browser tests pass" "health tab browser tests FAIL → node tests/health_ui_test.js"
+trow status_trim "status-trim/extract tests pass" "status-trim tests FAIL → python3 tests/status_trim_test.py"
+trow bg_cap "shipm-bg and agent-cap tests pass" "shipm-bg/agent-cap tests FAIL → python3 tests/bg_cap_test.py"
+trow chat_health "chat health tests pass" "chat health tests FAIL → node tests/chat_health_test.js"
+trow panel_ui "panel browser tests pass (or Chrome missing)" "panel browser tests FAIL → node tests/panel_ui_test.js"
+trow panel_align "panel alignment tests pass (or Chrome missing)" "panel alignment tests FAIL → node tests/panel_align_test.js"
+trow panel_scroll "panel scroll tests pass (or Chrome missing)" "panel scroll tests FAIL → node tests/panel_scroll_test.js"
+[[ -f "$WS/docs/idea-review-method.md" ]] && ok "idea review method present" || bad "docs/idea-review-method.md missing"
+held=$(grep -vE "^#|^$" "$WS/config/ci-hold.txt" 2>/dev/null | tr "\n" " "); [[ -n "$held" ]] && echo "  info on hold (config/ci-hold.txt): $held"
+
+if [[ "$HOOKMODE" == v1 ]]; then :   # plan capture = the StatusLine event of hooks/shipm-hook, checked in the hook rows above
+else grep -q 'plan-capture.sh' "$HOME/.claude/settings.json" && ok "live plan usage captured for the panel" || bad "plan-capture status line missing → sync-tools"; fi
+
+echo "Shared memory"
+# memlink-begin (tests/private/doctor_memlink_test.py runs these lines)
+MAIN_WS="$WS"; WT=""   # in a git worktree the links point into the MAIN checkout: resolve it through the git common dir
+gc=$(git -C "$WS" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); gd=$(git -C "$WS" rev-parse --path-format=absolute --git-dir 2>/dev/null)
+if [[ -n "$gc" && -n "$gd" && "$gc" != "$gd" && "$(basename "$gc")" == ".git" ]]; then MAIN_WS="$(cd "$gc/.." && pwd -P)"; WT=" (worktree: main checkout $MAIN_WS)"; fi
+for f in "$HOME/.claude/CLAUDE.md"; do
+  lt="$(readlink "$f" 2>/dev/null)"
+  if [[ "$lt" == "$WS/memory/GLOBAL.md" ]]; then ok "$f → memory/GLOBAL.md"
+  elif [[ -n "$WT" && "$lt" == "$MAIN_WS/memory/GLOBAL.md" ]]; then ok "$f → memory/GLOBAL.md$WT"
+  else bad "$f not linked to the shared memory → sync-tools"; fi
+done
+# memlink-end
+if [[ -f "$WS/memory/GLOBAL.md" ]]; then n=$(wc -l < "$WS/memory/GLOBAL.md" | tr -d ' '); [[ $n -le 120 ]] && ok "GLOBAL.md $n lines" || warn "GLOBAL.md is $n lines (keep under 120: move detail into topic files)"
+else ok "no global memory in this install"; fi
+[[ "$(git -C "$WS" config core.hooksPath 2>/dev/null)" == .githooks ]] && ok "workspace repo auto-pushes" || warn "workspace repo auto-push off → sync-tools"
+
+echo "Shipmiracle core"
+# shipmiracle-core-begin (rows come from bin/shipm doctor --rows; a FAIL row fails doctor, a missing launcher is a warning only)
+if [[ -x "$WS/bin/shipm" ]]; then
+  while IFS= read -r l; do printf '%s\n' "$l"; [[ "$l" == "  FAIL "* ]] && fail=1; done < <("$WS/bin/shipm" doctor --rows 2>&1)
+else warn "bin/shipm missing or not executable"; fi
+# shipmiracle-core-end
+
+echo "Skills and agents"
+# only lines whose packs column (4th) contains "global" are installed for the user; pack skills (web...) are installed per project
+glob_lines() { grep -E '^- [^(]' "$WS/skills/APPROVED.md" | awk -F'|' '{p=$4; gsub(/ /,"",p); n=split(p,a,","); for(i=1;i<=n;i++) if(a[i]=="global"){print; break}}'; }
+miss=0; while IFS='|' read -r pkg skill why packs; do pkg=$(echo "${pkg#- }"|xargs); skill=$(echo "$skill"|xargs); [[ -n "$pkg" && -n "$skill" && "$skill" != "*" ]] || continue
+  [[ -d "$HOME/.agents/skills/$skill" || -d "$HOME/.claude/skills/$skill" ]] || { miss=$((miss+1)); bad "approved skill $skill not installed → skills-sync"; }
+done < <(glob_lines)
+[[ $miss -eq 0 ]] && ok "approved global skills installed ($(glob_lines | wc -l | tr -d ' ') listed)"
+# dlog-begin (SHIPMIRACLE_STATE honoured only with SHIPMIRACLE_TEST=1; the daily log lives in $STATE/v1/logs since Platform v2 P2; the old reports/ folder still counts until its files age out)
+last=$(ls -t "$([[ "${SHIPMIRACLE_TEST:-}" == 1 && -n "${SHIPMIRACLE_STATE:-}" ]] && printf %s "$SHIPMIRACLE_STATE" || printf %s "$HOME/.local/state/shipmiracle")"/v1/logs/daily-*.log "$WS"/reports/daily-*.log 2>/dev/null | head -1)
+# dlog-end
+if [[ -n "$last" ]]; then age=$(( ($(date +%s) - $(date -r "$last" +%s)) / 86400 )); [[ $age -le 2 ]] && ok "daily update ran $(basename "$last" .log | sed 's/daily-//')" || warn "daily update last ran $age days ago (Mac asleep at 09:00?)"
+else warn "daily update has not run yet"; fi
+launchctl list 2>/dev/null | grep com.shipmiracle.daily >/dev/null && ok "daily schedule loaded (09:00)" || bad "daily schedule not loaded → sync-tools"
+if [[ $FULL -eq 0 ]]; then skipped "no agents waiting for promotion"
+else c=$(out promote); [[ "$c" == 0 ]] && ok "no agents waiting for promotion" || warn "$c project agent(s) qualify for the master team → promote-agent --candidates"; fi
+allp=$(out agentchk)
+probs=$(printf '%s\n' "$allp" | grep -v ': \[dod\] ')       # model rule (model + reason + flow role)
+dodp=$(printf '%s\n' "$allp" | grep ': \[dod\] ' | sed 's/: \[dod\] /: /')   # DoD block / maxTurns: warn level, a separate line
+MN=" $(cd "$WS/agents/claude" && ls *.md | tr '\n' ' ')"
+sumup() { MN="$MN" awk -F/ '{n[$1]++; f[$1]=$0; split($0, a, ":"); k=split(a[1], b, "/"); if (index(ENVIRON["MN"], " " b[k] " ") == 0) po[$1]=po[$1] " " b[k]} END {for (p in n) print (n[p] > 1 ? p ": " n[p] " agent files " ENVIRON["WHAT"] (po[p] != "" ? " (project-only:" po[p] ")" : "") " → shipm agents migrate-team " p: f[p])}'; }
+[[ -z "$probs" ]] && ok "every agent follows the model rule (model + reason + flow role)" || while IFS= read -r l; do warn "agent model rule: $l"; done <<< "$(printf '%s\n' "$probs" | WHAT="break it" sumup)"
+[[ -z "$dodp" ]] && ok "every agent has the DoD block (Verdict line) and maxTurns" || while IFS= read -r l; do warn "agent needs DoD block (warn only; QA verdicts of these agents count as unknown): $l"; done <<< "$(printf '%s\n' "$dodp" | WHAT="need the DoD block or maxTurns" sumup)"
+trow flow_gate "team flow check tests pass" "team flow check tests FAIL → python3 tests/flow_gate_test.py"
+trow watch "watch tests pass" "watch tests FAIL → python3 tests/watch_test.py"
+trow health_contract "health contract tests pass (every item kind declared once)" "health contract tests FAIL → python3 tests/health_contract_test.py"
+trow health_replay "health replay tests pass (real-shape fixtures)" "health replay tests FAIL → python3 tests/private/health_replay_test.py"
+[[ -f "$WS/tests/ext_health_fix_test.js" ]] && trow ext_health_fix "health fix-chain tests pass" "health fix-chain tests FAIL → node tests/ext_health_fix_test.js"
+[[ -f "$WS/tests/flow_gate_bash_test.py" ]] && trow flow_gate_bash "flow_gate_bash_test passes" "flow_gate_bash_test FAIL → python3 tests/flow_gate_bash_test.py"
+echo "  info flow_gate_scenarios_test and the other suites are not run here (slow) → run bin/test-all"
+ev=$(python3 -I -c 'import json,sys,time
+c=time.time()-86400; n={"gate_tamper":0,"gate_tamper_detected":0,"gate_env_override":0,"bypass":0,"level_changed":0}
+try:
+    for l in open(sys.argv[1],errors="ignore"):
+        try: e=json.loads(l)
+        except ValueError: continue
+        if isinstance(e,dict) and e.get("ts",0)>=c and e.get("event") in n: n[e["event"]]+=1
+except OSError: pass
+print(n["gate_tamper"],n["gate_tamper_detected"],n["gate_env_override"],n["bypass"],n["level_changed"])' "$HOME/.local/state/shipmiracle/flow-events.jsonl" 2>/dev/null)
+read -r ev_t ev_d ev_e ev_b ev_l <<<"${ev:-0 0 0 0 0}"
+echo "  info team flow events, last 24 h: gate_tamper $ev_t, gate_tamper_detected $ev_d, gate_env_override $ev_e, bypass $ev_b, level_changed $ev_l"
+[[ "${ev_d:-0}" -gt 0 || "${ev_e:-0}" -gt 0 ]] && warn "team flow: $ev_d gate_tamper_detected and $ev_e gate_env_override event(s) in the last 24 h → ~/.local/state/shipmiracle/flow-events.jsonl"
+if [[ -f "$WS/config/gate-deny.off" ]]; then warn "deny rules switched off by config/gate-deny.off: remove the file to re-enable"
+else dm=$(out gdeny); [[ "$(rcof gdeny)" == 0 ]] && ok "gate files protected by native deny rules" || bad "gate files not protected by native deny rules; $(printf '%s\n' "$dm" | grep '^missing:' | head -3 | tr '\n' ';') → run bin/gate-deny install (owner)"; fi
+fe=$(python3 -c 'import sys,time
+c=time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time()-86400))
+try: print(sum(1 for l in open(sys.argv[1],errors="ignore") if l[:19]>=c and l[:2]=="20"))
+except OSError: print(0)' "$([[ "${SHIPMIRACLE_TEST:-}" == 1 && -n "${SHIPMIRACLE_STATE:-}" ]] && printf %s "$SHIPMIRACLE_STATE" || printf %s "$HOME/.local/state/shipmiracle")/flow-errors.log" 2>/dev/null)
+# flow-errors.log line = "YYYY-MM-DD HH:MM:SS <traceback>" (local time); any entry in the last 24 h is a red row (a gate bug, not a warning)
+[[ "${fe:-0}" -gt 0 ]] && bad "team flow check logged $fe internal error(s) in the last 24 h (it failed open, so work went through unchecked) → ~/.local/state/shipmiracle/flow-errors.log" || ok "team flow check: no internal errors in the last 24 h"
+
+# 21 Oct 2026: a registered Shipmiracle hook whose script is gone leaves the gate OFF (the wrapper fails open and warns); one in a temp folder will vanish. tests/doctor_rows_test.py runs the lines between the markers.
+# hookscripts-begin
+while IFS=$'\t' read -r hk_kind hk_ev hk_path; do
+  [[ -n "$hk_kind" ]] || continue
+  [[ "$hk_kind" == missing ]] && bad "hook script missing: gate OFF ($hk_ev → $hk_path) → shipm sync --repair-hooks (dry run), then --apply; afterwards shipm sync" || bad "hook script in a temp folder ($hk_ev → $hk_path); it will vanish and turn the gate OFF → shipm sync --repair-hooks, then --apply; afterwards shipm sync"
+  hk_any=1
+done < <(python3 -I -c 'import os,sys; sys.path.insert(0,sys.argv[1])
+from pathlib import Path
+from shipmiracle import settings_sync as s
+h=Path(os.environ.get("HOME") or os.path.expanduser("~"))
+for k,e,p in s.script_problems(h/".claude"/"settings.json", sys.argv[1], h): print(k,e,p,sep="\t")' "$WS" 2>/dev/null)
+[[ -z "${hk_any:-}" ]] && ok "registered Shipmiracle hook scripts exist and none is in a temp folder"
+# hookscripts-end
+
+# 21 Oct 2026: leftover automation browsers and orphaned test runs, as the watcher last saw them (Health tab kinds stray_browser and stray_testrun)
+# strays-begin
+STATE_S="$([[ "${SHIPMIRACLE_TEST:-}" == 1 && -n "${SHIPMIRACLE_STATE:-}" ]] && printf %s "$SHIPMIRACLE_STATE" || printf %s "$HOME/.local/state/shipmiracle")"
+read -r st_b st_t <<<"$(python3 -I -c 'import json,sys
+try: it=json.load(open(sys.argv[1])).get("items",[])
+except Exception: it=[]
+print(sum(1 for i in it if i.get("kind")=="stray_browser"), sum(1 for i in it if i.get("kind")=="stray_testrun"))' "$STATE_S/health.json" 2>/dev/null)"
+[[ "${st_b:-0}" -gt 0 || "${st_t:-0}" -gt 0 ]] && warn "stray processes: ${st_b:-0} automation browser(s) and ${st_t:-0} orphaned test run(s) older than their limit → Health tab Fix (temp-profile browsers and test-all in a known workspace only)" || ok "no stray automation browser or orphaned test run"
+# strays-end
+
+# 21 Oct 2026: worktree records (QA and review snapshots belong in ~/Developer/.worktrees/<project>/snap-<tag>, never in /tmp). tests/doctor_rows_test.py runs the lines between the markers.
+# worktrees-begin
+wt_msgs=""
+wt_repos=("$WS"); for wt_p in "$HOME"/Developer/*/; do wt_p=${wt_p%/}; [[ -d "$wt_p/.git" && ! -L "$wt_p" ]] && wt_repos+=("$wt_p"); done
+for wt_r in "${wt_repos[@]}"; do
+  wt_main=$(git -C "$wt_r" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || continue
+  wt_main=${wt_main%/.git}; [[ "$wt_r" == "$wt_main" || "$wt_r" == "$WS" ]] || continue
+  wt_out=$(python3 -I -c 'import os,subprocess,sys,time
+repo=sys.argv[1]; roots=[os.path.realpath(x) for x in ("/tmp","/private/tmp","/var/folders","/private/var/folders")]
+r=subprocess.run(["git","-C",repo,"worktree","list","--porcelain"],capture_output=True,text=True)
+cur={}; recs=[]
+for l in (r.stdout+"\n").splitlines():
+    if not l.strip():
+        if cur.get("worktree"): recs.append(cur)
+        cur={}; continue
+    k,_,v=l.partition(" "); cur[k]=v or True
+msgs=[]
+for i,c in enumerate(recs):
+    p=c["worktree"]; rp=os.path.realpath(p)
+    if i==0: continue
+    if "prunable" in c or not os.path.isdir(p): msgs.append("dangling record "+p)
+    elif any(rp==t or rp.startswith(t+"/") for t in roots): msgs.append("worktree under a temp folder "+p)
+    elif "detached" in c and time.time()-os.stat(p).st_mtime>86400: msgs.append("detached snapshot older than 24 h "+p)
+print("; ".join(msgs))' "$wt_r" 2>/dev/null)
+  [[ -n "$wt_out" ]] && wt_msgs="$wt_msgs$(basename "$wt_r"): $wt_out | "
+done
+[[ -n "$wt_msgs" ]] && warn "stale worktree records: ${wt_msgs% | } → git worktree prune (forgets dangling records only; a folder is removed by hand: git worktree remove --force <path>)" || ok "stale worktree records: none"
+# worktrees-end
+
+# P4 T8 / review m2: events of the last 24 h in <state>/v1/events.jsonl (tests/doctor_rows_test.py runs the lines between the markers)
+# hookev-begin
+STATE_D="$([[ "${SHIPMIRACLE_TEST:-}" == 1 && -n "${SHIPMIRACLE_STATE:-}" ]] && printf %s "$SHIPMIRACLE_STATE" || printf %s "$HOME/.local/state/shipmiracle")"
+read -r hm pu pu_names <<<"$(python3 -I -c 'import sys,time,json
+c=time.time()-86400; n=0; u=0; names=[]
+try:
+    for l in open(sys.argv[1],errors="ignore"):
+        try: e=json.loads(l)
+        except ValueError: continue
+        if not isinstance(e,dict) or not isinstance(e.get("ts"),(int,float)) or e["ts"]<c: continue
+        if e.get("kind")=="hook_module_error": n+=1
+        elif e.get("kind")=="playbook.untrusted":
+            u+=1; p=str(e.get("project") or "?")[:40]
+            if p not in names and all(ch.isalnum() or ch in "._-" for ch in p): names.append(p)
+except OSError: pass
+print(n,u,",".join(names[:5]) or "-")' "$STATE_D/v1/events.jsonl" 2>/dev/null)"
+# core.py logs a hook_module_error event per crashed module; the dispatcher fails open, so a red row, not a warning
+[[ "${hm:-0}" -gt 0 ]] && bad "hook dispatcher: $hm module error(s) in the last 24 h (the module failed open, so its check did not run) → grep hook_module_error $STATE_D/v1/events.jsonl; see $STATE_D/flow-errors.log" || ok "hook dispatcher: no module errors in the last 24 h"
+# stage logs playbook.untrusted when a project's playbook.json does not match its registry sha: the gate runs guided with the snapshot or defaults
+[[ "${pu:-0}" -gt 0 ]] && bad "playbook untrusted: $pu event(s) in the last 24 h (project: ${pu_names:--}); the gate used the registry snapshot or the defaults → shipm playbook show --project <name>, then shipm playbook set to re-trust" || ok "playbooks: no untrusted playbook in the last 24 h"
+# hookev-end
+
+echo "Secret scan"
+command -v gitleaks >/dev/null 2>&1 && ok "gitleaks $(command -v gitleaks)" || warn "install gitleaks (brew install gitleaks): the git hooks skip the secret scan without it"
+# P4 T8: a blocked auto-push (gitleaks finding in HEAD) in the workspace or any project under ~/Developer is a red row
+# pushblock-begin
+seen_pb=""
+for p in "$WS" "$HOME"/Developer/*/; do
+  p=${p%/}; [[ -d "$p" ]] || continue; n=$(basename "$p")
+  pb=$(git -C "$p" rev-parse --git-path PUSH-BLOCKED 2>/dev/null) || continue
+  [[ "$pb" == /* ]] || pb="$p/$pb"
+  [[ "$seen_pb" == *"|$pb|"* ]] && continue; seen_pb="$seen_pb|$pb|"
+  [[ -f "$pb" ]] && bad "push blocked by gitleaks in $n: $(head -c 200 "$pb" | tr '\n' ' ') → fix or rewrite the commit, then git push"
+done
+# pushblock-end
+
+echo "GitHub"
+# GitHub doesn't let a personal token list app installs; the phone/cloud test is the proof (ACCEPTANCE F3).
+echo "  info Claude GitHub App: not verified (optional; only needed for cloud sessions; ACCEPTANCE F3 is BLOCKED until the owner installs it)"
+
+echo "Projects"
+for i in "${!PROJS[@]}"; do r=$(out "proj.$((i+1))"); [[ -n "$r" ]] && printf '%s\n' "$r"; grep -q '^  FAIL ' <<<"$r" && fail=1; done
+[[ $FULL -eq 0 && ${#PROJS[@]} -gt 0 ]] && skipped "session brief size of each project (hook output near 10 KB)"
+
+echo "CI on main"
+ci="$HOME/.local/state/shipmiracle/ci.json"
+if [[ -f "$ci" ]]; then
+  while IFS='|' read -r n state url err; do
+    if [[ -n "$err" ]]; then warn "CI status unknown for $n: $err"
+    elif [[ "$state" == failure ]]; then warn "CI failing: $n → $url"
+    else ok "CI $n: $state"; fi
+  done < <(python3 -c '
+import json,sys
+for n,v in sorted(json.load(open(sys.argv[1])).items()):
+    err = (v.get("error") or ("stale" if v.get("stale") else "")).replace("|", "/")
+    print("%s|%s|%s|%s" % (n, v.get("conclusion") or v.get("status") or "unknown", v.get("url", ""), err))' "$ci" 2>/dev/null)
+else echo "  info no CI status yet (bin/ci-status runs from the guard every 10 min while VS Code is open)"; fi
+
+echo "Workspace"
+n=$(ls "$WS"/agents/claude/*.md 2>/dev/null | wc -l | tr -d ' '); [[ "$n" == 10 ]] && ok "10 Claude roles" || bad "$n Claude roles (expect 10)"
+for d in "$HOME/.claude" "$HOME/.local" "$HOME/.vscode" "$HOME/Developer"; do [[ -d "$d" ]] || bad "$d missing (cleaner?)"; done
+(cd "$WS" && [[ -z "$(git status --porcelain 2>/dev/null)" ]]) && ok "workspace repo clean" || warn "workspace repo has uncommitted changes"
+# Owner decision 15 Oct 2026: no Time Machine. GitHub holds the repos and the project memory.
+tmutil destinationinfo 2>/dev/null | grep -q 'Name' && ok "Time Machine destination set" || warn "no Time Machine (owner's choice); only chat transcripts in ~/.claude are not backed up"
+
+wait
+[[ $FULL -eq 0 && $SK -gt 0 ]] && echo "  info fast mode: $SK check(s) not run (listed above as 'not checked in fast mode'); run bin/doctor --full for all of them"
+echo "  info doctor took ${SECONDS}s ($([[ $FULL -eq 1 ]] && echo full || echo fast) mode)"
+if [[ $fail -eq 0 ]]; then if [[ $FULL -eq 0 && $SK -gt 0 ]]; then echo "doctor: all good (fast mode, $SK check(s) not run)"; else echo "doctor: all good"; fi
+else echo "doctor: problems above"; exit 1; fi

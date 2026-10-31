@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""shipm-presence-build: build the Touch ID helper that the escalating autopilot commands use (owner step; idempotent; one line of output).
+  bin/shipm-presence-build            build (or confirm it is already built) -> <config>/bin/shipm-presence + <config>/presence.sha256
+  bin/shipm-presence-build --check    report only (used by bin/doctor): exit 0 built and unchanged, 1 not built / changed, 2 no Swift compiler
+Source: tools/presence/shipm-presence.swift (about 50 lines, LocalAuthentication, no network). Compiled locally with the installed swiftc and signed ad hoc; nothing is
+downloaded. The recorded sha256 lets Shipmiracle refuse a helper that was swapped. Needs no password and no admin rights."""
+import hashlib, os, pathlib, shutil, subprocess, sys, tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(HERE))
+from shipmiracle import paths  # noqa: E402
+
+SRC = HERE / "tools" / "presence" / "shipm-presence.swift"
+
+
+def sha(p) -> str:
+    return hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
+
+
+def _owner_gate() -> str:
+    """'' or one plain sentence. Outside a sandbox the build runs only (1) from the engine's OWN checkout, the one registered as engine.dir (a copy in /tmp is refused: a rebuilt helper could
+    say ok without Touch ID), (2) in a terminal the owner started (CLAUDECODE unset, no claude above it), (3) after a typed yes read from /dev/tty."""
+    from shipmiracle import config, owner, terminal
+    if not owner.proof_required():
+        return ""
+    try:
+        eng = config.get("engine.dir")
+    except Exception:
+        eng = None
+    if not eng or os.path.realpath(str(eng)) != os.path.realpath(str(HERE)):
+        return "Touch ID helper NOT built: this copy (%s) is not the engine checkout registered as engine.dir (%s). Run bin/shipm-presence-build from your engine folder." % (HERE, eng or "not set: run shipm init")
+    try:
+        owner.gate("build", "bin/shipm-presence-build")
+    except owner.OwnerRefused as e:
+        return "Touch ID helper NOT built: %s" % e
+    try:
+        # terminal.ask_line, not a text-mode r+ open of the tty: that raises "not seekable" on macOS 27, so the build could never get past this question
+        if terminal.ask_line('Build the Touch ID helper from %s? Type "yes": ' % HERE).strip() != "yes":
+            return "Touch ID helper NOT built: you did not type yes."
+    except OSError:
+        return "Touch ID helper NOT built: this needs you at a terminal: run bin/shipm-presence-build in Terminal or VS Code."
+    return ""
+
+
+def main(argv) -> int:
+    check = "--check" in argv
+    if sys.platform != "darwin":
+        print("Touch ID helper: not supported on this OS yet (macOS only); the autopilot commands that need owner confirmation stay off here")
+        return 2
+    cfg = pathlib.Path(paths.config_dir())
+    binp, rec = cfg / "bin" / "shipm-presence", cfg / "presence.sha256"
+    swiftc = shutil.which("swiftc") or ("/usr/bin/swiftc" if os.path.exists("/usr/bin/swiftc") else None)
+    want_src = sha(SRC)
+    built = False
+    try:
+        t = rec.read_text().split()
+        built = binp.is_file() and len(t) == 2 and t[0] == sha(binp) and t[1] == want_src
+    except OSError:
+        built = False
+    if built:
+        print("Touch ID helper: ready (%s)" % binp)
+        return 0
+    if check:
+        if swiftc is None:
+            print("Touch ID helper: not built, and this Mac has no Swift compiler: install Xcode command line tools (xcode-select --install), then run bin/shipm-presence-build")
+            return 2
+        print("Touch ID helper: not built. Fix: run bin/shipm-presence-build")
+        return 1
+    if swiftc is None:
+        print("Touch ID helper NOT built: no Swift compiler found. Run: xcode-select --install, then bin/shipm-presence-build")
+        return 2
+    refusal = _owner_gate()
+    if refusal:
+        print(refusal)
+        return 2
+    cfg.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (cfg / "bin").mkdir(exist_ok=True, mode=0o700)
+    tmpd = pathlib.Path(tempfile.mkdtemp(prefix="shipmiracle-presence-"))
+    try:
+        out = tmpd / "shipm-presence"
+        r = subprocess.run([swiftc, "-O", "-o", str(out), str(SRC)], capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL)
+        if r.returncode != 0 or not out.is_file():
+            print("Touch ID helper NOT built: the Swift compiler failed (%s). Try: xcode-select --install" % (r.stderr.strip().splitlines() or ["no message"])[-1][:120])
+            return 1
+        subprocess.run(["/usr/bin/codesign", "-s", "-", "--force", str(out)], capture_output=True, timeout=60, stdin=subprocess.DEVNULL)    # ad hoc; best effort
+        os.chmod(out, 0o700)
+        shutil.copyfile(out, binp)
+        os.chmod(binp, 0o700)
+        rec.write_text("%s %s\n" % (sha(binp), want_src))
+        os.chmod(rec, 0o600)
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    try:
+        from shipmiracle import events
+        events.emit("owner.helper_built", {"sha8": sha(binp)[:8], "src8": want_src[:8]}, src="shipmiracle")          # the pin changed: `shipm owner status` and bin/doctor show when
+    except Exception:
+        pass
+    print("Touch ID helper built: %s (touch the sensor once to try it: %s --reason 'test')" % (binp, binp))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

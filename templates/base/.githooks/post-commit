@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Auto-push (when config git.autopush is on): every commit goes to GitHub right away, in the background, so nothing lives only on
+# this Mac. A failure (offline, no remote yet) leaves .git/PUSH-FAILED, which doctor and the
+# session brief report; the next successful push clears it. Installed via: git config core.hooksPath .githooks
+git remote get-url origin >/dev/null 2>&1 || exit 0
+branch=$(git branch --show-current 2>/dev/null); [[ -n "$branch" ]] || exit 0
+# --- switch: pushing after every commit is a per-machine choice, off unless `shipm config set git.autopush true` (the default of a fresh install is off).
+# Shipmiracle is looked up as in pre-push ($SHIPMIRACLE_ENGINE, the engine folder written in by apply-template, PATH, ~/.local/bin, this checkout); not found = off.
+#--AUTOPUSH-SWITCH-BEGIN--
+engine_hint="@SHIPMIRACLE_ENGINE@"; shipmiracle_bin=""; top=$(git rev-parse --show-toplevel 2>/dev/null)
+for c in "${SHIPMIRACLE_ENGINE:+$SHIPMIRACLE_ENGINE/bin/shipm}" "$engine_hint/bin/shipm" "$(command -v shipm 2>/dev/null)" "$HOME/.local/bin/shipm" "${top:+$top/bin/shipm}"; do
+  [[ -n "$c" && -f "$c" && -x "$c" ]] && { shipmiracle_bin=$c; break; }
+done
+[[ -n "$shipmiracle_bin" && "$("$shipmiracle_bin" config get git.autopush 2>/dev/null)" == true ]] || exit 0
+#--AUTOPUSH-SWITCH-END--
+# --- secret scan (gitleaks, brew install gitleaks): EVERY commit not on the remote yet is scanned (HEAD --not --remotes=origin; all of HEAD when
+# there is no remote ref), not only the new one. A finding (or a scanner error) means NO push; the marker PUSH-BLOCKED (in this worktree's git dir) tells
+# doctor and the session brief and records the blocked branch and sha. It is cleared only by a clean scan of the full unpushed range of that branch.
+# The pre-push hook runs the same scan on the refs being pushed, so a manual git push after a block is refused too. Missing gitleaks: warn, push as before.
+#--GITLEAKS-POST-BEGIN--
+blocked=$(git rev-parse --git-path PUSH-BLOCKED 2>/dev/null) || blocked=.git/PUSH-BLOCKED
+if command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks detect --log-opts="HEAD --not --remotes=origin" --redact --no-banner >&2; then
+    if [[ -f "$blocked" ]]; then   # an earlier block is open: clear it when its own branch is clean now (or gone); another branch's block stays
+      line=$(head -n 1 "$blocked" 2>/dev/null); bb=""
+      [[ "$line" == *"branch="* ]] && { bb=${line##*branch=}; bb=${bb%% sha=*}; }
+      if [[ -z "$bb" || "$bb" == "$branch" ]] || ! git rev-parse -q --verify "refs/heads/$bb" >/dev/null 2>&1 \
+         || gitleaks detect --log-opts="refs/heads/$bb --not --remotes=origin" --redact --no-banner >&2; then rm -f "$blocked"; fi
+    fi
+  else
+    printf '%s gitleaks finding in HEAD; see git log -1; branch=%s sha=%s\n' "$(date '+%Y-%m-%d %H:%M')" "$branch" "$(git rev-parse HEAD 2>/dev/null)" > "$blocked"
+    echo "auto-push blocked: gitleaks finding in the commits not pushed yet (HEAD is $(git rev-parse --short HEAD 2>/dev/null)). Fix it, amend or rewrite the commit, then git push. Marker: $blocked" >&2
+    exit 0
+  fi
+else
+  echo "gitleaks not installed: secret scan skipped (brew install gitleaks)" >&2
+fi
+#--GITLEAKS-POST-END--
+failed=$(git rev-parse --git-path PUSH-FAILED 2>/dev/null) || failed=.git/PUSH-FAILED
+(
+  if git push -q -u origin "$branch" >/dev/null 2>&1 || { sleep 4; git push -q -u origin "$branch" >/dev/null 2>&1; }; then rm -f "$failed"
+  else date '+%Y-%m-%d %H:%M' > "$failed"; fi
+) >/dev/null 2>&1 &
+disown 2>/dev/null || true
+exit 0

@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""shipm-prefix: what sits in the fixed prompt prefix of a Claude Code session, as an ESTIMATE (bytes / 3.6 = tokens).
+Read-only: it reads ~/.claude/settings.json, ~/.claude.json, ~/.claude/plugins, ~/.claude/skills, ~/.claude/CLAUDE.md and
+the project's CLAUDE.md chain, .claude/agents, skills, .mcp.json. It never writes anything and never executes a project script
+unless you pass --run-hook (then only the SessionStart hook of --project, minimal env, temp HOME, 10 s).
+
+  shipm-prefix [--project DIR] [--json] [--mcp-list] [--run-hook] [--warn-tokens N] [--strict]
+    --json      machine-readable output
+    --mcp-list  also run `claude mcp list` (read-only, 25 s limit) to count claude.ai connectors
+    --run-hook  execute the project SessionStart hook to measure its output (trusted projects only; needs --project)
+    --warn-tokens N  warning threshold (default 33000)
+    --strict    exit 1 when a warning fires (default exit 0)
+
+Warnings (doctor style): estimate above 33000 tokens (configurable), or the project's own skill+agent descriptions above 8 KB.
+Constants that are assumptions, not measurements, are named below and marked "assumed" in the output.
+HOME is honoured (tests point it at a temp dir)."""
+import glob, json, os, re, subprocess, sys
+
+BYTES_PER_TOKEN = 3.6
+# The built-in floor alone is ~23.7k, so 25k can never be met; 33k leaves ~9k for everything we control.
+# Override: env SHIPMIRACLE_PREFIX_WARN_TOKENS or --warn-tokens N.
+WARN_TOKENS = int(os.environ.get("SHIPMIRACLE_PREFIX_WARN_TOKENS") or 33000)
+WARN_DESC_BYTES = 8 * 1024
+# Claude Code system prompt + built-in tools/agents/skills. Calibrated 20 Oct 2026: headless run with user layer and MCP
+# off (--setting-sources project,local --strict-mcp-config) = 30782 input tokens, minus this repo's project layer (~7.1k est).
+BASE_TOKENS = 23700
+# owner decision G4 (master plan v2 section 8): switch these off globally
+TRIM = {"plugin feature-dev": "trim (owner G4): 0 uses in 30 days; code-architect/explorer/reviewer duplicate our roles",
+        "plugin pr-review-toolkit": "trim (owner G4): 0 uses in 30 days; 6 agents with long example descriptions"}
+MCP_TOKENS_PER_SERVER = 700         # assumed: deferred tool names + instructions of one MCP server; calibrated on probe 7 / 20 Oct run
+ENTRY_OVERHEAD = 30                 # bytes per listed skill/agent/command: name, bullet, separators
+
+
+def tok(b):
+    return int(round(b / BYTES_PER_TOKEN))
+
+
+def home():
+    return os.path.expanduser("~")
+
+
+def jload(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def frontmatter(path):
+    """(name, description) from the YAML header of a .md file; description may be folded over lines."""
+    try:
+        t = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None, ""
+    m = re.match(r"---\s*\n(.*?)\n---", t, re.S)
+    if not m:
+        return None, ""
+    name, desc, cur = None, [], None
+    for ln in m.group(1).splitlines():
+        k = re.match(r"([A-Za-z_-]+):\s*(.*)$", ln)
+        if k:
+            cur = k.group(1)
+            if cur == "name":
+                name = k.group(2).strip().strip("\"'")
+            elif cur == "description":
+                desc = [k.group(2).strip().lstrip(">|-").strip()]
+        elif cur == "description" and ln.startswith((" ", "\t")):
+            desc.append(ln.strip())
+    return name, " ".join(x for x in desc if x).strip("\"'")
+
+
+def entry_bytes(path):
+    n, d = frontmatter(path)
+    n = n or os.path.basename(os.path.dirname(path) if os.path.basename(path) == "SKILL.md" else path)
+    return len((n + d).encode("utf-8")) + ENTRY_OVERHEAD
+
+
+def md_files(d):
+    return sorted(glob.glob(os.path.join(d, "*.md")))
+
+
+def skill_files(d):
+    out = sorted(glob.glob(os.path.join(d, "*", "SKILL.md")))
+    out += sorted(glob.glob(os.path.join(d, "*", "*", "SKILL.md")))        # skills/synced/<name>/SKILL.md
+    return out
+
+
+def plugin_dir(name_at, installed, root):
+    ent = installed.get("plugins", {}).get(name_at) or []
+    for e in ent:
+        p = e.get("installPath")
+        if p and os.path.isdir(p):
+            return p
+    n, _, mk = name_at.partition("@")
+    c = [p for p in glob.glob(os.path.join(root, "cache", mk, n, "*")) if os.path.isdir(p)]
+    return max(c, key=os.path.getmtime) if c else None
+
+
+def hook_context(project, run):
+    """(bytes, note). Default: the hook script is NOT executed; only its file size is reported.
+    run=True (--run-hook): execute it with a minimal env, temp HOME, 10 s timeout, cwd=project, output capped at 64 KB."""
+    sh = os.path.join(project, ".claude", "hooks", "session-start.sh")
+    if not os.path.isfile(sh):
+        return 0, "no SessionStart hook in the project"
+    size = os.path.getsize(sh)
+    if not run:
+        return 0, "not measured (run with --run-hook); script is %d bytes" % size
+    sys.stderr.write("running %s; only use on projects you trust\n" % sh)
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="shipmiracle-prefix-home-")
+    try:
+        r = subprocess.run(["bash", sh], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=project, timeout=10,
+                           env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": project, "HOME": tmp})
+        return min(len(r.stdout), 65536), "bytes printed to the session at start (measured with --run-hook)"
+    except (OSError, subprocess.SubprocessError):
+        return 0, "hook failed or timed out"
+    finally:
+        try: os.rmdir(tmp)
+        except OSError: pass
+
+
+def claude_md_bytes(path, seen=None):
+    """Size of a CLAUDE.md including @imports (one level of recursion guard)."""
+    seen = seen if seen is not None else set()
+    path = os.path.realpath(path)
+    if path in seen or not os.path.isfile(path):
+        return 0
+    seen.add(path)
+    t = open(path, encoding="utf-8", errors="replace").read()
+    n = len(t.encode("utf-8"))
+    for imp in re.findall(r"^@(\S+)\s*$", t, re.M):
+        p = os.path.expanduser(imp)
+        p = p if os.path.isabs(p) else os.path.join(os.path.dirname(path), p)
+        n += claude_md_bytes(p, seen)
+    return n
+
+
+def mcp_list():
+    try:
+        r = subprocess.run(["claude", "mcp", "list"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=25)
+        return [l for l in r.stdout.decode("utf-8", "replace").splitlines() if re.match(r"^\S.*:\s", l)]
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def measure(project, with_mcp_list=False, run_hook=False, warn_tokens=None):
+    warn_tokens = warn_tokens or WARN_TOKENS
+    H = home()
+    items = []   # dict(item, kind, bytes, tokens, note, advice)
+
+    settings = jload(os.path.join(H, ".claude", "settings.json"))
+    state = jload(os.path.join(H, ".claude.json"))
+    root = os.path.join(H, ".claude", "plugins")
+    installed = jload(os.path.join(root, "installed_plugins.json"))
+    usage = state.get("pluginUsage") or {}
+
+    def add(item, kind, b, note="", advice="keep", fixed=False, tokens=None):
+        advice = TRIM.get(item, advice)
+        if advice == "keep" and kind == "plugin" and not item.endswith("-lsp"):
+            u = (usage.get(item.split(" ", 1)[1] + "@claude-plugins-official") or {}).get("usageCount")
+            if u == 0:
+                advice = "candidate: 0 recorded uses"
+        items.append({"item": item, "kind": kind, "bytes": b, "tokens": tok(b) if tokens is None else tokens,
+                      "note": note, "advice": advice})
+
+
+    add("Claude Code system prompt + built-in tools + built-in agents", "base", 0, "calibrated constant, not ours to trim", "keep",
+        tokens=BASE_TOKENS)
+
+    # plugins
+    for pn, on in sorted((settings.get("enabledPlugins") or {}).items()):
+        if not on:
+            continue
+        d = plugin_dir(pn, installed, root)
+        short = pn.split("@")[0]
+        if not d:
+            add("plugin " + short, "plugin", 0, "enabled but folder not found", "check")
+            continue
+        ag, cm, sk = md_files(os.path.join(d, "agents")), md_files(os.path.join(d, "commands")), skill_files(os.path.join(d, "skills"))
+        b = sum(entry_bytes(p) for p in ag + cm + sk)
+        mcp = jload(os.path.join(d, ".mcp.json"))
+        servers = mcp.get("mcpServers", mcp) if isinstance(mcp, dict) else {}
+        servers = {k: v for k, v in servers.items() if isinstance(v, dict)}
+        t = tok(b) + MCP_TOKENS_PER_SERVER * len(servers)
+        lsp = os.path.isfile(os.path.join(d, ".lsp.json")) or short.endswith("-lsp")
+        note = "%d agents, %d commands, %d skills" % (len(ag), len(cm), len(sk))
+        if servers:
+            note += ", MCP: " + ",".join(servers) + " (assumed %d tok each)" % MCP_TOKENS_PER_SERVER
+        if lsp:
+            note += ", LSP server"
+        add("plugin " + short, "plugin", b, note, "keep", tokens=t)
+
+    # user-scope MCP servers
+    for name in sorted((state.get("mcpServers") or {})):
+        add("MCP server " + name + " (user scope)", "mcp", 0, "assumed %d tok" % MCP_TOKENS_PER_SERVER, "keep", tokens=MCP_TOKENS_PER_SERVER)
+    # project .mcp.json
+    pm = jload(os.path.join(project, ".mcp.json")).get("mcpServers", {})
+    for name in sorted(pm):
+        add("MCP server " + name + " (project .mcp.json)", "mcp", 0, "assumed %d tok" % MCP_TOKENS_PER_SERVER, "keep", tokens=MCP_TOKENS_PER_SERVER)
+    if with_mcp_list:
+        lst = mcp_list()
+        if lst is None:
+            add("claude mcp list", "mcp", 0, "could not run", "check", tokens=0)
+        else:
+            conn = [l for l in lst if "claude.ai" in l]
+            if conn:
+                add("claude.ai connectors (%d)" % len(conn), "mcp", 0, "; ".join(l.split(":")[0] for l in conn), "keep",
+                    tokens=MCP_TOKENS_PER_SERVER * len(conn))
+
+    # global skills / agents / commands
+    gs = skill_files(os.path.join(H, ".claude", "skills"))
+    add("global skills ~/.claude/skills", "skills", sum(entry_bytes(p) for p in gs), "%d skills" % len(gs))
+    ga = md_files(os.path.join(H, ".claude", "agents"))
+    if ga:
+        add("global agents ~/.claude/agents", "agents", sum(entry_bytes(p) for p in ga), "%d agents" % len(ga))
+    gc = md_files(os.path.join(H, ".claude", "commands"))
+    if gc:
+        add("global commands ~/.claude/commands", "commands", sum(entry_bytes(p) for p in gc), "%d commands" % len(gc))
+
+    # CLAUDE.md chain
+    add("~/.claude/CLAUDE.md", "memory", claude_md_bytes(os.path.join(H, ".claude", "CLAUDE.md")))
+    chain, d, seen = 0, os.path.realpath(project), set()
+    while True:
+        for n in ("CLAUDE.md", "CLAUDE.local.md"):
+            chain += claude_md_bytes(os.path.join(d, n), seen)
+        if d == os.path.dirname(d) or d == os.path.realpath(H):
+            break
+        d = os.path.dirname(d)
+    add("project CLAUDE.md chain (+ @imports)", "memory", chain)
+
+    # project layer
+    pa = md_files(os.path.join(project, ".claude", "agents"))
+    ps = skill_files(os.path.join(project, ".claude", "skills")) + skill_files(os.path.join(project, ".agents", "skills"))
+    pc = md_files(os.path.join(project, ".claude", "commands"))
+    pdesc = sum(entry_bytes(p) for p in pa + ps)
+    add("project agents + skills", "project", pdesc, "%d agents, %d skills" % (len(pa), len(ps)))
+    if pc:
+        add("project commands", "project", sum(entry_bytes(p) for p in pc), "%d commands" % len(pc))
+    hb, hnote = hook_context(project, run_hook)
+    add("SessionStart hook output", "hook", hb, hnote)
+
+    total = sum(i["tokens"] for i in items)
+    warns = []
+    if total > warn_tokens:
+        warns.append("prefix estimate %d tokens is above %d" % (total, warn_tokens))
+    if pdesc > WARN_DESC_BYTES:
+        warns.append("project skill+agent descriptions %d bytes are above %d" % (pdesc, WARN_DESC_BYTES))
+    return {"project": project, "bytes_per_token": BYTES_PER_TOKEN, "estimate": True, "total_tokens": total,
+            "project_desc_bytes": pdesc, "items": sorted(items, key=lambda i: -i["tokens"]), "warnings": warns}
+
+
+def render(r):
+    out = ["Fixed prefix, ESTIMATE (bytes / %.1f = tokens) for %s" % (r["bytes_per_token"], r["project"]), ""]
+    out.append("%-52s %7s %7s  %-28s %s" % ("item", "bytes", "tokens", "advice", "note"))
+    for i in r["items"]:
+        out.append("%-52s %7d %7d  %-28s %s" % (i["item"][:52], i["bytes"], i["tokens"], i["advice"][:28], i["note"]))
+    save = sum(i["tokens"] for i in r["items"] if i["advice"].startswith("trim"))
+    out.append("%-52s %7s %7d" % ("TOTAL (estimate)", "", r["total_tokens"]))
+    out.append("trim (owner G4) would save about %d tokens -> %d" % (save, r["total_tokens"] - save))
+    out.append("project skill+agent descriptions: %d bytes (limit %d)" % (r["project_desc_bytes"], WARN_DESC_BYTES))
+    for w in r["warnings"]:
+        out.append("WARN " + w)
+    if not r["warnings"]:
+        out.append("OK prefix within limits")
+    return "\n".join(out)
+
+
+def main(argv):
+    proj = os.getcwd()
+    if "--project" in argv:
+        proj = os.path.abspath(argv[argv.index("--project") + 1])
+    if "--run-hook" in argv and "--project" not in argv:
+        sys.stderr.write("--run-hook needs an explicit --project DIR\n"); return 2
+    wt = int(argv[argv.index("--warn-tokens") + 1]) if "--warn-tokens" in argv else None
+    r = measure(proj, "--mcp-list" in argv, "--run-hook" in argv, wt)
+    print(json.dumps(r, indent=1) if "--json" in argv else render(r))
+    return 1 if (r["warnings"] and "--strict" in argv) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

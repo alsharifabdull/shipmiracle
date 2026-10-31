@@ -1,0 +1,203 @@
+{
+ "auto_decisions": [
+  {
+   "charter_sha": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+   "detail": "build next",
+   "rule": "continue",
+   "stage": "do",
+   "ts": 1792503208
+  },
+  {
+   "charter_sha": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+   "detail": "plan matches charter ch-c1c1c1c1",
+   "rule": "charter_approve",
+   "stage": "approve",
+   "ts": 1792503208
+  }
+ ],
+ "charter": {
+  "goal": "",
+  "id": "ch-c1c1c1c1"
+ },
+ "cr": {
+  "blocked": null,
+  "closed": 1760003000,
+  "diff": {
+   "deps": false,
+   "files": 2,
+   "lines": 22,
+   "risk": [],
+   "ui": false
+  },
+  "id": "CR-001",
+  "lane": "full",
+  "lenses": {
+   "correctness": "ACCEPT",
+   "design": null,
+   "risk": null
+  },
+  "opened": 1760000060,
+  "reports": [],
+  "stage": "done",
+  "status": "delivered",
+  "title": "إصلاح RTL fix on login",
+  "verified": true,
+  "verify_fails": 0
+ },
+ "generated": 1760005000,
+ "git": {
+  "base": "1111111111111111111111111111111111111111",
+  "commits": [
+   {
+    "sha": "a1b2c3d",
+    "subject": "RTL fix on login: mirror the form"
+   }
+  ],
+  "files": [
+   "b.txt",
+   "src.txt"
+  ],
+  "files_total": 2,
+  "head": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "pushed": true
+ },
+ "labels": {
+  "approve": "OK",
+  "deliver": "Release",
+  "do": "Build",
+  "intake": "Request",
+  "learn": "Learn",
+  "plan": "Plan",
+  "review": "Review",
+  "scope": "Scope",
+  "verify": "Test"
+ },
+ "lang": "en",
+ "level": "strict",
+ "next": null,
+ "owner_waits": {
+  "n": 1,
+  "secs": 480
+ },
+ "project": "sample-app",
+ "stages": [
+  {
+   "by": "scoper",
+   "id": "scope",
+   "label": "Scope",
+   "model": null,
+   "status": "done:scoper",
+   "ts": 1760000120
+  },
+  {
+   "by": "planner",
+   "id": "plan",
+   "label": "Plan",
+   "model": "opus",
+   "status": "done:planner",
+   "ts": 1760000180
+  },
+  {
+   "by": "owner",
+   "id": "approve",
+   "label": "OK",
+   "model": null,
+   "status": "done:owner",
+   "ts": 1760000720
+  },
+  {
+   "by": "builder-frontend",
+   "id": "do",
+   "label": "Build",
+   "model": null,
+   "status": "done:builder-frontend",
+   "ts": 1760000900
+  },
+  {
+   "by": "verifier",
+   "id": "verify",
+   "label": "Test",
+   "model": "sonnet",
+   "status": "done:verifier",
+   "ts": 1760000960
+  },
+  {
+   "by": "reviewer",
+   "id": "review",
+   "label": "Review",
+   "model": null,
+   "status": "done:reviewer",
+   "ts": 1760001020
+  },
+  {
+   "by": "lead",
+   "id": "deliver",
+   "label": "Release",
+   "model": null,
+   "status": "done:lead",
+   "ts": 1760001080
+  },
+  {
+   "by": "lead",
+   "id": "learn",
+   "label": "Learn",
+   "model": null,
+   "status": "done:lead",
+   "ts": 1760001200
+  }
+ ],
+ "tokens": 412000,
+ "type": "app",
+ "v": 1,
+ "verdicts": [
+  {
+   "attempt": 1,
+   "by": "verifier",
+   "cmd": "npm test",
+   "counts": {
+    "failed": 2,
+    "passed": 212,
+    "total": 214
+   },
+   "evidence": "npm test -> 212 passed, 2 failed",
+   "failed": [
+    "tests/login.rtl.test.ts:41",
+    "tests/login.rtl.test.ts:77"
+   ],
+   "not_verified": "screenshots at 375 px",
+   "stage": "verify",
+   "ts": 1760000840,
+   "verdict": "FAIL"
+  },
+  {
+   "attempt": 2,
+   "by": "verifier",
+   "cmd": "npm test",
+   "counts": {
+    "failed": 0,
+    "passed": 214,
+    "total": 214
+   },
+   "evidence": "`npm test` -> 214 passed, 0 failed",
+   "failed": [],
+   "not_verified": "real device RTL rendering",
+   "stage": "verify",
+   "ts": 1760000960,
+   "verdict": "PASS"
+  },
+  {
+   "attempt": 1,
+   "by": "reviewer",
+   "cmd": "",
+   "counts": null,
+   "evidence": "",
+   "failed": [],
+   "lens": "correctness",
+   "not_verified": "",
+   "stage": "review",
+   "ts": 1760001020,
+   "verdict": "ACCEPT"
+  }
+ ],
+ "wall_s": 2820
+}

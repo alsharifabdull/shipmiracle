@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""vscode-recs <project-dir> — merge base + stack extension recommendations into .vscode/extensions.json (keeps project extras)."""
+import json, pathlib, re, sys
+ws = pathlib.Path(__file__).resolve().parent.parent; d = pathlib.Path(sys.argv[1])
+agents = "".join((d/n).read_text(errors="ignore") for n in ("CLAUDE.md", "AGENTS.md") if (d/n).exists())   # CLAUDE.md first, AGENTS.md for one release
+m = re.search(r"Stack rules — (\w+)", agents); kind = {"Web":"web","iOS":"ios","Python":"python","API":"api","Home":"home"}.get(m.group(1) if m else "", "")
+want = json.load(open(ws/"templates/base/.vscode/extensions.json"))["recommendations"]
+s = ws/f"templates/{kind}/.vscode/extensions.stack.json"
+if kind and s.exists(): want += json.load(open(s))["recommendations"]
+f = d/".vscode/extensions.json"; f.parent.mkdir(exist_ok=True)
+cur = json.loads(f.read_text()) if f.exists() else {"recommendations": []}
+recs = cur.get("recommendations", []); new = recs + [e for e in want if e not in recs]
+if new != recs:
+    cur["recommendations"] = new; f.write_text(json.dumps(cur, indent=2) + "\n"); print("  updated .vscode/extensions.json")

@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""agent-check FILE.md... — thin shim over `shipm agents check` (shipmiracle/agents.py holds the rules).
+Does each agent file follow the model rule (CLAUDE.md, docs/standards/team.md)? model: opus|sonnet|haiku (not inherit or missing), and the
+lines 'Model reason: …' and 'Flow role: …' (plan | build | test | review | scope | design | report | route | support) in the body.
+Also: a '## DoD' section with a 'Verdict:' line, and an integer 'maxTurns:' in the header for every role except route.
+Two kinds of problem, printed as separate lines: model-rule problems ("file: ...", exit 1) and DoD/maxTurns problems
+("file: [dod] ...", warn level: exit 3 when there are no model-rule problems). A file with both prints both lines.
+Exit 0 = clean, 1 = a model rule is broken, 3 = only the DoD block / maxTurns are missing.
+Callers: promote-agent, doctor, the panel (data.js). For a whole project team use `shipm agents check --project DIR`."""
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+try:
+    from shipmiracle import agents
+except ImportError:
+    sys.stderr.write("agent-check: the Shipmiracle package is missing next to this script\n"); sys.exit(2)
+probs = []
+for f in sys.argv[1:]:
+    probs += agents.check_file(f, "file")
+for line in agents.format_problems(probs):
+    print(line)
+sys.exit(agents.exit_code(probs))

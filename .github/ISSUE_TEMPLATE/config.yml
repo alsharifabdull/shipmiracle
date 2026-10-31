@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security problem
+    url: https://github.com/alsharifabdull/shipmiracle/security/advisories/new
+    about: Report it privately here. Do not open a public issue and do not post secrets or logs.
+  - name: Getting help
+    url: https://github.com/alsharifabdull/shipmiracle/blob/main/SUPPORT.md
+    about: Read the troubleshooting guide first.

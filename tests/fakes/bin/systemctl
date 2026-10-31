@@ -1,0 +1,16 @@
+#!/bin/sh
+# fake systemctl for the shipm init/uninstall timer tests: logs its argv to $SHIPMIRACLE_FAKE_LOG; the enabled timers live in $SHIPMIRACLE_FAKE_DIR/systemd-enabled. Shell builtins only.
+N=${0##*/}
+[ -n "$SHIPMIRACLE_FAKE_LOG" ] && printf "%s\n" "$N $*" >> "$SHIPMIRACLE_FAKE_LOG"
+L="$SHIPMIRACLE_FAKE_DIR/systemd-enabled"
+[ "$1" = "--user" ] || exit 1          # this product only ever talks to the user manager
+shift
+has() { [ -e "$L" ] && while read -r l; do [ "$l" = "$1" ] && return 0; done < "$L"; return 1; }
+case "$1" in
+  enable) for a in "$@"; do case "$a" in *.timer) has "$a" || printf "%s\n" "$a" >> "$L";; esac; done; exit 0 ;;
+  disable) : > "$L.new"
+    if [ -e "$L" ]; then while read -r l; do keep=1; for a in "$@"; do [ "$l" = "$a" ] && keep=0; done; [ $keep = 1 ] && printf "%s\n" "$l" >> "$L.new"; done < "$L"; fi
+    /bin/mv "$L.new" "$L"; exit 0 ;;
+  is-enabled|is-active) for a in "$@"; do case "$a" in *.timer) has "$a" && exit 0;; esac; done; exit 1 ;;
+esac
+exit 0

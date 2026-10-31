@@ -1,0 +1,14 @@
+#!/bin/sh
+# fake external tool for the shipm init/uninstall tests: logs its argv to $SHIPMIRACLE_FAKE_LOG; state files live in $SHIPMIRACLE_FAKE_DIR. Shell builtins only.
+N=${0##*/}
+[ -n "$SHIPMIRACLE_FAKE_LOG" ] && printf "%s\n" "$N $*" >> "$SHIPMIRACLE_FAKE_LOG"
+L="$SHIPMIRACLE_FAKE_DIR/launchd-loaded"
+case "$1" in
+  bootstrap) b=${3##*/}; printf "%s\n" "${b%.plist}" >> "$L"; exit 0 ;;
+  print) want=${2##*/}; [ -e "$L" ] && while read -r l; do [ "$l" = "$want" ] && exit 0; done < "$L"; exit 113 ;;
+  bootout)
+    want=${2##*/}; : > "$L.new"
+    if [ -e "$L" ]; then while read -r l; do [ "$l" = "$want" ] || printf "%s\n" "$l" >> "$L.new"; done < "$L"; fi
+    /bin/mv "$L.new" "$L"; exit 0 ;;
+esac
+exit 0

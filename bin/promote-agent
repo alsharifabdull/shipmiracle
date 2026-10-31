@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# promote-agent <project-dir> <role-name>   — make a project-only agent part of the master team.
+# promote-agent --candidates                 — list project-only agents and skills (and borrowed items) and why they qualify.
+# promote-agent --report                     — the table plus the summary line from one scan (what bin/daily uses).
+# promote-agent --daily-line                 — the one-line summary bin/daily prints (empty when there is nothing to say).
+# Rule: new agents are created inside one project (.claude/agents/<name>.md) and stay there.
+# An agent becomes master (every project) only when the owner promotes it — the candidates list shows the ones that already
+# exist in 2+ projects or were called 10+ times.
+# Promote = check -> copy into agents/claude -> commit -> the owner runs `shipm agents install` (it never runs from here) -> the project's
+# own copy is deleted if it equals the master (user-level layout), or gets an `overrides:` line if it differs.
+set -uo pipefail
+WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+candidates() {   # the counting lives in shipmiracle/usage.py (incremental cached transcript scan; thresholds PROMOTE_CALLS / PROMOTE_PROJECTS are defined there only)
+  (cd "$WS" && python3 -m shipmiracle.usage table)
+}
+report() {   # table + summary line from ONE scan (bin/daily)
+  (cd "$WS" && python3 -m shipmiracle.usage report)
+}
+daily_line() {   # one plain line for bin/daily ("" when there is nothing to say); never fails the caller
+  (cd "$WS" && python3 -m shipmiracle.usage daily-line) 2>/dev/null || true
+}
+
+if [[ "${1:-}" == "--candidates" ]]; then candidates; exit 0; fi
+if [[ "${1:-}" == "--report" ]]; then report; exit $?; fi
+if [[ "${1:-}" == "--daily-line" ]]; then daily_line; exit 0; fi
+dir="${1:-}"; role="${2:-}"
+[[ -n "$dir" && -n "$role" ]] || { echo "usage: promote-agent <project-dir> <role> | --candidates" >&2; exit 2; }
+src="$dir/.claude/agents/$role.md"; [[ -f "$src" ]] || { echo "no such agent: $src" >&2; exit 2; }
+dst="$WS/agents/claude/$role.md"
+layout=$("$WS/bin/shipm" config get agents.layout 2>/dev/null || echo legacy)
+mark_override() {   # add an `overrides: <role>` line to the project's copy (it differs from the master and stays the project's own)
+  grep -q '^overrides:' "$src" || python3 - "$src" "$role" <<'PY'
+import re, sys
+p, name = sys.argv[1:3]; t = open(p, encoding="utf-8").read()
+m = re.match(r"(---\r?\n.*?)(\r?\n---)", t, re.S)
+if m: open(p, "w", encoding="utf-8").write(m.group(1) + "\noverrides: %s" % name + t[m.end(1):]); print("Added 'overrides: %s' to the project's copy (it differs from the master)." % name)
+PY
+}
+tidy_copy() {       # the project's copy: deleted when identical to the master and the team lives at user level; marked when it differs
+  if cmp -s "$src" "$dst"; then
+    if [[ "$layout" == userlevel ]]; then rm -f "$src" && echo "Deleted the project's copy (identical to the master; the user-level team provides it): $src"
+    else echo "Layout is legacy: the project's copy stays (identical to the master)."; fi
+  else mark_override; fi
+}
+if [[ -f "$dst" ]]; then
+  echo "$role is already a master agent."; tidy_copy; exit 0
+fi
+grep -q '^name:' "$src" && grep -q '^description:' "$src" || { echo "agent file needs name: and description: frontmatter" >&2; exit 2; }
+"$WS/bin/agent-check" "$src" || { echo "Not promoted: fix the agent file first (model rule and DoD block, CLAUDE.md and docs/standards/team.md)." >&2; exit 2; }
+"$WS/bin/shipm" agents check --master --in-project "$dir" "$src"; rc=$?
+[[ $rc -eq 0 || $rc -eq 3 ]] || { echo "Not promoted: the file does not pass the master rules above (shipm agents check --master)." >&2; exit 2; }
+[[ $rc -eq 3 ]] && echo "note: the warnings above (for example a skill that is not installed) do not stop the promotion."
+cp "$src" "$dst"
+echo "Promoted $role to the master team (agents/claude/$role.md)."
+(cd "$WS" && git add -- "agents/claude/$role.md" && git commit -q -m "Promote agent $role to the master team" -- "agents/claude/$role.md" && echo "Committed (auto-push).")
+tidy_copy
+echo
+echo "OWNER STEP (not run from here): in a terminal run   shipm agents install --dry-run   then   shipm agents install"
+if [[ "$layout" != userlevel ]]; then
+  echo "Rolling it out to every project (legacy layout)…"
+  for d in "$HOME"/Developer/*/; do
+    d=${d%/}; [[ -d "$d" && ! -L "$d" && "$(basename "$d")" != AI-Workspace ]] || continue
+    "$WS/bin/apply-template" "$d" | grep -E "agents/$role|agents/${role//-/_}" || true
+  done
+fi

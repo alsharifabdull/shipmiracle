@@ -1,0 +1,608 @@
+#!/usr/bin/env python3
+"""test-all: run every suite in tests/ (*_test.py with python3, *_test.js with node), in parallel.
+Per suite: counts of ^PASS / ^FAIL / ^SKIP lines (each SKIP line is printed under the suite line and counted in TOTAL). A suite that ran 0 checks (no PASS,
+no FAIL, exit 0) is NOT TESTED, never PASS: with a SKIP line it is an explained skip (not a failure); without one it counts as a failure (a silent zero
+hides a suite that did not run). Exit 1 if any suite fails (2 on bad options).
+Options: --jobs N (or env SHIPMIRACLE_TEST_JOBS; default min(4, cpus-1); 1 = serial), --only SUBSTRING, --list, --fast
+(skips the two slowest suites; labelled PARTIAL RUN; never the merge gate). Chrome-based suites share one lock group.
+--retry-failed (off by default; the release export turns it on): after the main run each FAILED suite is re-run ONCE alone (jobs 1, same isolation); a suite that then exits 0 with
+checks passed is reported FLAKY (passed alone on retry), counted as passed and listed with its first failure line; a suite that fails again stays failed; a suite that cannot start is
+never retried. The TOTAL line gets ", flaky N". The real ~/.claude/settings.json changing during the run is a FAIL only when the change holds a temp-folder path or adds/removes a
+Shipmiracle hook entry; any other change (another live Claude session writing the file) is a WARN naming the file.
+Env SHIPMIRACLE_TESTS_DIR points at another tests folder (used by tests/test_all_test.py).
+ISOLATION (21 Oct 2026): every suite runs with its OWN fresh temp folders for HOME, SHIPMIRACLE_HOME, CLAUDE_CONFIG_DIR, SHIPMIRACLE_CONFIG, SHIPMIRACLE_STATE, SHIPMIRACLE_WS and SHIPMIRACLE_DEV
+(tests/shipmiracle_isolation.py) and AGENT_BROWSER_ARGS="--use-mock-keychain,--password-store=basic"; the caller's SHIPMIRACLE_* variables are not passed on. A suite that needs
+the real repo as its workspace is listed in REPO_WS_SUITES (the repo is then read-only for it: with SHIPMIRACLE_TEST=1 Shipmiracle refuses to write <workspace>/config files of a
+non-temp workspace). test-all fingerprints the REAL ~/.claude/settings.json and ~/.config/shipmiracle before the run and again on every exit path (normal end,
+exception, SIGINT/SIGTERM/SIGHUP, a suite timeout). If the settings file changed it prints a loud FAIL naming it, removes ONLY the Shipmiracle hook entries whose
+script is missing or in a temp folder (the `shipm sync --repair-hooks` logic, never a blind restore) and the run STILL exits FAILED."""
+import atexit, fnmatch, glob, hashlib, importlib.util, json, os, re, shutil, signal, subprocess, sys, threading, time
+
+TIMEOUT = int(os.environ.get("SHIPMIRACLE_TEST_TIMEOUT") or 900)
+HERE = os.path.dirname(os.path.abspath(__file__))
+TESTS = os.environ.get("SHIPMIRACLE_TESTS_DIR") or os.path.join(HERE, "..", "tests")
+TESTS = os.path.abspath(TESTS)
+
+
+# ---- guard: a test must never change the owner's real files -------------------------------------
+import pwd
+HOME = pwd.getpwuid(os.getuid()).pw_dir     # the account's real home (not $HOME): a run under a temp HOME must still guard the real files
+_RH = os.environ.get("SHIPMIRACLE_REAL_HOME")
+_TEMPS = {os.path.realpath(x) for x in ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders")}
+if (os.environ.get("SHIPMIRACLE_TEST") == "1" and _RH and os.path.realpath(_RH) != os.path.realpath(HOME)
+        and any(os.path.realpath(_RH) == t or os.path.realpath(_RH).startswith(t + "/") for t in _TEMPS)):
+    HOME = _RH                              # test seam (tests/test_all_test.py): a decoy folder in a temp root stands in for the real home (L3: same rule as shipmiracle.paths.real_home)
+STATE = os.path.join(HOME, ".local", "state", "shipmiracle")
+WSDIR = os.path.abspath(os.path.join(HERE, ".."))
+TESTING = os.environ.get("SHIPMIRACLE_TEST") == "1"
+
+
+def real_workspaces():
+    """Every workspace checkout whose config the tests must not touch: this one, the main checkout when run from a git worktree
+    (via git's common dir), and ~/Developer/AI-Workspace when it exists."""
+    out = []
+    try:
+        r = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=WSDIR, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
+        c = r.stdout.decode().strip()
+        if r.returncode == 0 and c:
+            c = os.path.realpath(os.path.join(WSDIR, c))
+            if os.path.basename(c) == ".git":
+                out.append(os.path.dirname(c))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    home_ws = os.path.join(HOME, "Developer", "AI-Workspace")
+    if os.path.isdir(home_ws):
+        out.append(os.path.realpath(home_ws))
+    try:       # the configured engine checkout (engine.dir), when the config names one
+        e = subprocess.run([os.path.join(WSDIR, "bin", "shipm"), "config", "get", "engine.dir"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
+        ed = e.stdout.decode().strip()
+        if e.returncode == 0 and ed and ed != "null" and os.path.isdir(ed):
+            out.append(os.path.realpath(ed))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    out.append(WSDIR)
+    seen = []
+    for x in out:
+        if x not in seen:
+            seen.append(x)
+    return seen
+
+
+def shipmiracle_config_dir():
+    """The owner's private shipm config folder. Under the SHIPMIRACLE_GUARD_FILES test override it is SHIPMIRACLE_GUARD_SHIPMIRACLECONFIG (default: none)."""
+    if TESTING and os.environ.get("SHIPMIRACLE_GUARD_FILES"):
+        return os.environ.get("SHIPMIRACLE_GUARD_SHIPMIRACLECONFIG") or None
+    return os.path.join(HOME, ".config", "shipmiracle")
+
+
+def guard_paths():
+    out = []
+    if TESTING and os.environ.get("SHIPMIRACLE_GUARD_FILES"):
+        out = list(json.loads(os.environ["SHIPMIRACLE_GUARD_FILES"]))
+        cdir = shipmiracle_config_dir()
+        return out + ([os.path.join(cdir, n) for n in ("config.json", "registry.json")] if cdir else [])
+    for ws in real_workspaces():
+        out += [os.path.join(ws, "config", n) for n in ("flow.json", "watch.json", "gate-deny.off")]
+    out += [os.path.join(HOME, ".claude", n) for n in ("settings.json", "settings.local.json")]
+    out += [os.path.join(shipmiracle_config_dir(), n) for n in ("config.json", "registry.json")]   # absent is a stable value
+    out += sorted(glob.glob(os.path.join(HOME, "Library", "LaunchAgents", "com.shipmiracle.*")))   # P8 T7: `shipm init` writes these
+    return out
+
+
+# Claude Code rewrites ~/.claude.json many times a minute (counters, history), so only the parts that grant a session power are fingerprinted.
+CLAUDE_JSON_TOP = ("mcpServers", "enabledMcpjsonServers", "disabledMcpjsonServers", "hooks", "permissions", "allowedTools")
+CLAUDE_JSON_PROJECT = ("mcpServers", "enabledMcpjsonServers", "disabledMcpjsonServers", "allowedTools", "hasTrustDialogAccepted", "hooks")
+# state *.json that live hooks / the watcher / the panel legitimately rewrite while a run is going (same idea as the *.agents.json rule)
+# model-reset.json: the live guard daemon writes it when a /model choice had changed the saved default and puts opusplan back (the settings file then holds the same text as before, so no
+# settings change shows); the panel removes it on OK. A test that leaked into the real settings file would still show there (temp path).
+STATE_VOLATILE = ("ledger*.json*", "scorecard.json", "health.json", "snapshot*.json", "*.lock", "context.*.json", "flow.*.json", "*.agents.json",
+                  "*.mode.json", "*.limit.json", "*.model.json", "model-reset.json", "guard.json", "ci.json", "away.json", "ideas.json", "plan.json", "lineage.json", "watch-state.json",
+                  "v1/*")   # v1/*: the daemons mirror their state into <state>/v1 while tests run
+
+
+def claude_json_path():
+    return (os.environ.get("SHIPMIRACLE_GUARD_CLAUDE_JSON") if TESTING and os.environ.get("SHIPMIRACLE_GUARD_FILES") else None) or os.path.join(HOME, ".claude.json")
+
+
+def claude_json_digest(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return "absent"
+    try:
+        d = json.loads(raw.decode("utf-8", "replace"))
+        keep = {k: d[k] for k in CLAUDE_JSON_TOP if isinstance(d, dict) and k in d}
+        pr = d.get("projects") if isinstance(d, dict) and isinstance(d.get("projects"), dict) else {}
+        keep["projects"] = {pp: {k: v[k] for k in CLAUDE_JSON_PROJECT if k in v} for pp, v in pr.items() if isinstance(v, dict)}
+        return hashlib.sha256(json.dumps(keep, sort_keys=True).encode()).hexdigest()
+    except (ValueError, AttributeError):
+        return "unparsable"
+
+
+def extra_guard():
+    """Name -> fingerprint for the guarded things that are not plain files: ~/.claude.json (power-granting keys), ~/.claude/agents
+    (listing + content hashes), the *.json files directly under the state dir (name + size + mtime, not contents)."""
+    out = {claude_json_path(): claude_json_digest(claude_json_path())}
+    override = TESTING and bool(os.environ.get("SHIPMIRACLE_GUARD_FILES"))
+    if not override:        # P8 T7: ~/.local/bin/shipm is a link into the engine; fingerprint the link, not the file it points to
+        lk = os.path.join(HOME, ".local", "bin", "shipm")
+        out[lk + " (link)"] = ("link:" + os.readlink(lk)) if os.path.islink(lk) else ("file" if os.path.exists(lk) else "absent")
+    if not override:        # every file of ~/.config/shipmiracle (name + sha256), not only config.json and registry.json
+        cd = shipmiracle_config_dir()
+        for root, dirs, files in os.walk(cd):
+            for n in sorted(files):
+                fp = os.path.join(root, n)
+                out[fp] = digest(fp)
+    agents = os.environ.get("SHIPMIRACLE_GUARD_AGENTS") if override else os.path.join(HOME, ".claude", "agents")
+    sdir = os.environ.get("SHIPMIRACLE_GUARD_STATEJSON") if override else STATE
+    if agents:
+        try:
+            names = sorted(os.listdir(agents))
+        except OSError:
+            names = None
+        out[agents + "/ (listing)"] = "absent" if names is None else hashlib.sha256("\n".join(names).encode()).hexdigest()
+        for n in names or []:
+            out[os.path.join(agents, n)] = digest(os.path.join(agents, n))
+    if sdir:
+        projects = real_projects()    # <project>.json is the live per-project status file that hooks rewrite during any session
+        try:
+            for n in sorted(os.listdir(sdir)):
+                if not n.endswith(".json") or n[:-5] in projects or any(fnmatch.fnmatch(n, g) for g in STATE_VOLATILE):
+                    continue
+                try:
+                    st = os.stat(os.path.join(sdir, n))
+                    out[os.path.join(sdir, n)] = "%d:%d" % (st.st_size, st.st_mtime_ns)
+                except OSError:
+                    out[os.path.join(sdir, n)] = "absent"
+        except OSError:
+            pass
+    return out
+
+
+def event_files():
+    if TESTING and os.environ.get("SHIPMIRACLE_GUARD_EVENTS"):
+        return list(json.loads(os.environ["SHIPMIRACLE_GUARD_EVENTS"]))
+    return [os.path.join(STATE, "flow-events.jsonl"), os.path.join(STATE, "events.log")]
+
+
+def real_projects():
+    d = os.environ.get("SHIPMIRACLE_GUARD_DEVDIR") if TESTING else None
+    d = d or os.path.join(HOME, "Developer")
+    try:
+        return set(os.listdir(d))
+    except OSError:
+        return set()
+
+
+def digest(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return "absent"
+
+
+def read_lines(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+def settings_path():
+    return os.path.join(HOME, ".claude", "settings.json")
+
+
+def fingerprint():
+    files = {p: digest(p) for p in guard_paths()}
+    files.update(extra_guard())
+    try:
+        with open(settings_path(), "rb") as f:
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        text = None
+    return {"files": files, "lines": {p: len(read_lines(p)) for p in event_files()}, "settings_text": text}
+
+
+def _leaves(o, under_hooks=False, out=None, hooks=None):
+    """every string leaf of a JSON value (out), and those under a top-level "hooks" key (hooks)"""
+    out = set() if out is None else out
+    hooks = set() if hooks is None else hooks
+    if isinstance(o, dict):
+        for k, v in o.items():
+            _leaves(v, under_hooks or k == "hooks", out, hooks)
+    elif isinstance(o, list):
+        for v in o:
+            _leaves(v, under_hooks, out, hooks)
+    elif isinstance(o, str):
+        out.add(o)
+        if under_hooks:
+            hooks.add(o)
+    return out, hooks
+
+
+def settings_change_is_ours(old_text, new_text):
+    """True (FAIL) when the change to settings.json holds a temp-folder path or adds/removes a Shipmiracle hook entry, or cannot be read; False (WARN) for any other edit,
+    which is what another live Claude session rewriting the file looks like."""
+    try:
+        old, new = json.loads(old_text), json.loads(new_text)
+    except (TypeError, ValueError):
+        return True
+    ao, ho = _leaves(old)
+    an, hn = _leaves(new)
+    diff = ao ^ an
+    hdiff = ho ^ hn
+    temps = tuple(t.rstrip("/") + "/" for t in _TEMPS) + ("/tmp/", "/private/tmp/")
+    if any(any(t in x for t in temps) for x in diff):
+        return True
+    return any(re.search(r"shipm", x, re.I) for x in hdiff)
+
+
+def guard_diff(before, now, warn=None):
+    """Names of guarded things that changed. Event files: only new test-style owner-panel / level_changed lines count. `warn` (a list): settings.json changes that are not ours
+    (no temp path, no Shipmiracle hook entry) go there instead of the result."""
+    bad = [p for p in sorted(set(before["files"]) | set(now["files"])) if before["files"].get(p, "absent") != now["files"].get(p, "absent")]
+    sp = settings_path()
+    if warn is not None and sp in bad and before.get("settings_text") is not None and now.get("settings_text") is not None \
+            and not settings_change_is_ours(before["settings_text"], now["settings_text"]):
+        bad.remove(sp)
+        warn.append(sp)
+    real = None
+    for p, n0 in before["lines"].items():
+        new = read_lines(p)[n0:]
+        for l in new:
+            if "level_changed" not in l and not re.search(r'"by":\s*"owner-panel"', l):
+                continue
+            try:
+                proj = json.loads(l).get("project")
+            except (ValueError, AttributeError):
+                proj = None
+            real = real if real is not None else real_projects()
+            if proj is None or proj not in real:
+                bad.append("%s (new line: %s)" % (p, l[:80]))
+                break
+    return bad
+
+
+def suites():
+    out = []
+    for d in (TESTS, os.path.join(TESTS, "private")):   # tests/private/ holds the owner-only suites; absent in the public export
+        if os.path.isdir(d):
+            out += [("python3", p) for p in glob.glob(os.path.join(d, "*_test.py"))]
+            out += [("node", p) for p in glob.glob(os.path.join(d, "*_test.js"))]
+    return sorted(out, key=lambda s: os.path.basename(s[1]))
+
+
+SLOW = ("flow_gate_scenarios_test.py", "flow_gate_indexerror_test.py")   # started first; skipped by --fast
+USAGE = "usage: test-all [--jobs N] [--only SUBSTRING] [--list] [--fast] [--python-only] [--retry-failed]"
+
+
+def parse_args(argv):
+    o = {"jobs": None, "only": None, "list": False, "fast": False, "python_only": False, "retry": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--list":
+            o["list"] = True
+        elif a == "--guard-paths":
+            o["guard_paths"] = True
+        elif a == "--fast":
+            o["fast"] = True
+        elif a == "--retry-failed":
+            o["retry"] = True
+        elif a == "--python-only":      # for machines without node/Chrome (bin/test-linux container); labelled PARTIAL RUN
+            o["python_only"] = True
+        elif a in ("--jobs", "--only") or a.startswith(("--jobs=", "--only=")):
+            if "=" in a:
+                a, v = a.split("=", 1)
+            else:
+                i += 1
+                v = argv[i] if i < len(argv) else None
+            if v is None:
+                raise ValueError("%s needs a value" % a)
+            if a == "--jobs":
+                if not v.isdigit() or int(v) < 1:
+                    raise ValueError("--jobs needs a number >= 1")
+                o["jobs"] = int(v)
+            else:
+                o["only"] = v
+        else:
+            raise ValueError("unknown option %s" % a)
+        i += 1
+    if o["jobs"] is None:
+        env = os.environ.get("SHIPMIRACLE_TEST_JOBS")
+        if env:
+            if not env.isdigit() or int(env) < 1:
+                raise ValueError("SHIPMIRACLE_TEST_JOBS needs a number >= 1")
+            o["jobs"] = int(env)
+        else:
+            o["jobs"] = max(1, min(4, (os.cpu_count() or 2) - 1))
+    return o
+
+
+def group_of(runner, path):
+    """Suites that open a headless Chrome pick a random debugging port from overlapping ranges and write fixed /tmp/shipmiracle-*.html|png
+    files; they share one lock group so two of them never run at the same time. Everything else is free to run in parallel."""
+    try:
+        with open(path, "rb") as f:
+            return "chrome" if b"remote-debugging-port" in f.read() else None
+    except OSError:
+        return None
+
+
+PIDS = set()                    # process groups of the suites running right now
+PIDLOCK = threading.Lock()
+STOPPING = threading.Event()
+
+
+def kill_all():
+    with PIDLOCK:
+        pids = list(PIDS)
+    for pid in pids:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+REPO_WS_SUITES = frozenset()     # suites that get the repo itself as SHIPMIRACLE_WS (read-only for them); everything else gets an empty fresh workspace
+
+
+def load_isolation():
+    spec = importlib.util.spec_from_file_location("shipmiracle_isolation", os.path.join(WSDIR, "tests", "shipmiracle_isolation.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run_one(runner, path):
+    name = os.path.basename(path)
+    t0 = time.time()
+    timed_out = False
+    iso_root = None
+    try:
+        env, iso_root = load_isolation().isolated_env(os.environ, ws=WSDIR if name in REPO_WS_SUITES else None)
+        pr = subprocess.Popen([runner, path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
+                              cwd=os.path.dirname(HERE), start_new_session=True)
+        with PIDLOCK:
+            PIDS.add(pr.pid)
+        if STOPPING.is_set():
+            kill_all()
+        try:
+            out, _ = pr.communicate(timeout=TIMEOUT)
+            code = pr.returncode
+            text = out.decode("utf-8", "replace")
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(pr.pid, signal.SIGKILL)
+            except OSError:
+                pr.kill()
+            try:
+                out, _ = pr.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                out = b""
+            text = (out or b"").decode("utf-8", "replace") + "\nTIMEOUT after %d s" % TIMEOUT
+            code = "timeout"
+    except (OSError, SystemExit) as e:      # SystemExit: the isolation refused to start (for example a TMPDIR outside the fixed temp roots): a loud failure, never a silent zero
+        text = "cannot run: %s" % e
+        code = "error"
+    finally:
+        with PIDLOCK:
+            PIDS.discard(pr.pid if "pr" in locals() else None)
+        if iso_root:
+            shutil.rmtree(iso_root, ignore_errors=True)
+    if STOPPING.is_set() and code != 0:
+        text += "\nINTERRUPTED: test-all was stopped"
+    lines = text.splitlines()
+    p = sum(1 for l in lines if re.match(r"PASS", l))
+    f = sum(1 for l in lines if re.match(r"FAIL ", l))
+    if f == 0 and any(l.startswith("FAILED:") and l[7:].strip() not in ("", "0", "[]") for l in lines):
+        f = 1   # a summary "FAILED: <something>" is a failure; "FAILED: 0" / "FAILED: []" is not
+    if (code != 0 or timed_out) and f == 0:
+        f = 1
+    skips = [l.strip() for l in lines if l.startswith("SKIP")]
+    return name, p, f, code, time.time() - t0, lines, skips
+
+
+def _main():
+    global _BASE, _GUARD_DONE
+    try:
+        opt = parse_args(sys.argv[1:])
+    except ValueError as e:
+        print("test-all: %s\n%s" % (e, USAGE))
+        return 2
+    if opt.get("guard_paths"):
+        for k in sorted(fingerprint()["files"]):
+            print(k)
+        return 0
+    ss = suites()
+    skipped = []
+    if opt["only"]:
+        ss = [s for s in ss if opt["only"] in os.path.basename(s[1])]
+    nojs = []
+    if opt["python_only"]:
+        nojs = [s for s in ss if s[0] == "node"]
+        ss = [s for s in ss if s[0] != "node"]
+    if opt["fast"]:
+        skipped = [s for s in ss if os.path.basename(s[1]) in SLOW]
+        ss = [s for s in ss if s not in skipped]
+    if opt["list"]:
+        for _, p in ss:
+            print(os.path.basename(p))
+        return 0
+    partial = bool(skipped or opt["only"] or nojs)
+    if partial:
+        why = []
+        if opt["only"]:
+            why.append("--only %s" % opt["only"])
+        if nojs:
+            why.append("--python-only skips %d node suite(s)" % len(nojs))
+        if skipped:
+            why.append("--fast skips %s" % ", ".join(os.path.basename(p) for _, p in skipped))
+        print("PARTIAL RUN (%s): not a full check, never use it as the merge gate\n" % "; ".join(why))
+    jobs = max(1, min(opt["jobs"], len(ss) or 1))
+    order = sorted(ss, key=lambda s: (os.path.basename(s[1]) not in SLOW, os.path.basename(s[1])))   # slow suites first
+    groups = {path: group_of(runner, path) for runner, path in ss}
+    base = _BASE = fingerprint()
+    cv = threading.Condition()
+    pending = list(order)
+    busy = set()
+    state = {"tp": 0, "tf": 0, "bad": 0, "guard": None, "failed": [], "skipped": 0, "nt": [], "info": {}, "flaky": [], "warn": []}
+
+    def take():
+        with cv:
+            while True:
+                if not pending or STOPPING.is_set():
+                    return None
+                for s in pending:
+                    g = groups[s[1]]
+                    if g is None or g not in busy:
+                        pending.remove(s)
+                        if g:
+                            busy.add(g)
+                        return s
+                cv.wait()
+
+    def worker():
+        while True:
+            s = take()
+            if s is None:
+                return
+            name, p, f, code, dt, lines, skips = run_one(*s)
+            with cv:
+                if p == 0 and f == 0 and code == 0:
+                    print("%s: NOT TESTED, 0 checks ran%s (exit 0, %.1fs)" % (name, " (%d skipped)" % len(skips) if skips else " and nothing said why", dt), flush=True)
+                    state["nt"].append(name)
+                    if not skips:
+                        f = 1       # a silent zero is a failure: the suite did not run what it promises
+                else:
+                    print("%s: %d passed, %d failed%s (exit %s, %.1fs)" % (name, p, f, ", %d skipped" % len(skips) if skips else "", code, dt), flush=True)
+                for l in skips[:5]:
+                    print("    %s" % l[:160], flush=True)
+                if len(skips) > 5:
+                    print("    ... and %d more SKIP line(s)" % (len(skips) - 5), flush=True)
+                state["skipped"] += len(skips)
+                state["tp"] += p
+                state["tf"] += f
+                if state["guard"] is None:
+                    changed = guard_diff(base, fingerprint(), state["warn"])
+                    if changed:
+                        state["guard"] = (name, changed)
+                if f:
+                    state["bad"] += 1
+                    state["failed"].append((name, lines[-5:]))
+                    state["info"][name] = {"s": s, "p": p, "f": f, "code": code, "lines": lines}
+                if groups[s[1]]:
+                    busy.discard(groups[s[1]])
+                cv.notify_all()
+
+    def on_signal(signum, frame):
+        STOPPING.set()
+        state["signal"] = signum
+        kill_all()
+        with cv:
+            cv.notify_all()
+
+    atexit.register(kill_all)
+    for sg in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sg, on_signal)
+    state["signal"] = None
+    threads = [threading.Thread(target=worker) for _ in range(jobs)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    tp, tf, guard_hit = state["tp"], state["tf"], state["guard"]
+    if opt["retry"] and state["failed"] and not STOPPING.is_set():
+        print("\nRETRY: %d failed suite(s) are re-run once, alone" % len(state["failed"]), flush=True)
+        for name, tail in sorted(state["failed"]):
+            inf = state["info"][name]
+            if inf["code"] == "error":
+                print("%s: cannot run, not retried" % name, flush=True)
+                continue
+            n2, p2, f2, code2, dt2, lines2, skips2 = run_one(*inf["s"])
+            if code2 == 0 and f2 == 0 and p2 > 0:
+                first = next((l for l in inf["lines"] if l.startswith("FAIL")), inf["lines"][-1] if inf["lines"] else "")
+                print("%s: FLAKY (passed alone on retry): %d passed (%.1fs); first failure: %s" % (name, p2, dt2, first[:200]), flush=True)
+                state["flaky"].append((name, first[:200]))
+                tp += p2 - inf["p"]
+                tf -= inf["f"]
+                state["bad"] -= 1
+            else:
+                print("%s: failed again on retry (%d passed, %d failed, exit %s)" % (name, p2, f2, code2), flush=True)
+        state["failed"] = [(n, t) for n, t in state["failed"] if n not in {x[0] for x in state["flaky"]}]
+    for name, tail in sorted(state["failed"]):
+        print("\n--- %s: last 5 lines ---" % name)
+        for l in tail:
+            print(l)
+    if guard_hit is None:
+        changed = guard_diff(base, fingerprint(), state["warn"])
+        if changed:
+            guard_hit = ("(after the last suite)", changed)
+    _GUARD_DONE = True
+    if state["warn"] and not any(c.split(" (new line")[0] == settings_path() for c in (guard_hit[1] if guard_hit else [])):
+        print("\nWARN test-all: %s changed during the run, but the change holds no temp-folder path and no Shipmiracle hook entry: most likely another live Claude session wrote it; not counted as a failure" % settings_path())
+    if guard_hit:
+        note = "" if jobs == 1 else " [ran with %d jobs: the cause may be a suite running at the same time; rerun with --jobs 1 to pinpoint]" % jobs
+        print("\nFAIL test-all: a test changed a real file: %s (first changed after suite: %s)%s" % (", ".join(guard_hit[1]), guard_hit[0], note))
+        tf += 1
+        clean_real_settings(guard_hit[1])
+    if state["signal"]:
+        print("\nINTERRUPTED by signal %d: running suites were killed, %d suite(s) never started" % (state["signal"], len(pending)))
+        tf += 1
+    if state["flaky"]:
+        print("\nFLAKY suites (failed once, passed alone on retry; load flakes are triaged this way by hand):")
+        for n_, first_ in state["flaky"]:
+            print("  %s: %s" % (n_, first_))
+    print("\nTOTAL: suites %d, passed %d, failed %d%s%s%s" % (len(ss), tp, tf, ", flaky %d" % len(state["flaky"]) if state["flaky"] else "", ", skipped %d" % state["skipped"] if state["skipped"] else "",
+                                                     ", NOT TESTED %d (%s)" % (len(state["nt"]), ", ".join(sorted(state["nt"]))) if state["nt"] else ""))
+    if partial:
+        print("PARTIAL RUN: %d suite(s) not run or filtered out" % (len(suites()) - len(ss)))
+    if state["signal"]:
+        return 128 + state["signal"]
+    return 1 if tf else 0
+
+
+_BASE = None
+_GUARD_DONE = False
+
+
+def clean_real_settings(changed):
+    """The real settings.json changed during the run: remove ONLY the Shipmiracle hook entries whose script is missing or in a temp folder (shipmiracle.settings_sync.repair, the
+    `shipm sync --repair-hooks` logic; never a blind restore), and say what was done. The run still ends FAILED."""
+    sp = os.path.join(HOME, ".claude", "settings.json")
+    if os.environ.get("SHIPMIRACLE_TESTALL_NO_REPAIR") == "1":      # experiments against the real home: report only, never write
+        print("FAIL test-all: %s changed (report only: SHIPMIRACLE_TESTALL_NO_REPAIR=1)" % sp) if any(c.split(" (new line")[0] == sp for c in changed) else None
+        return
+    if not any(c.split(" (new line")[0] == sp for c in changed):
+        return
+    print("FAIL test-all: %s was changed by a test run (a test reached the real settings file)" % sp)
+    try:
+        sys.path.insert(0, WSDIR)
+        from shipmiracle import settings_sync
+        r = settings_sync.repair(path=sp, apply=True, home=HOME, emergency=True)
+        if r["changed"]:
+            print("test-all: removed %d Shipmiracle hook entr%s whose script is missing or in a temp folder from %s (backup %s)" % (len(r["removed"]), "y" if len(r["removed"]) == 1 else "ies", sp, r["backup"]))
+        else:
+            print("test-all: no Shipmiracle hook entry with a missing or temp-folder script was found in %s" % sp)
+        if _BASE and digest(sp) != _BASE["files"].get(sp):
+            print("test-all: %s still differs from the start of the run (something other than temp-folder shipm hooks changed): check it by hand%s" % (sp, "; backup of the changed file: " + r["backup"] if r.get("backup") else ""))
+    except BaseException as e:      # never hide the failure behind a repair problem
+        print("test-all: could NOT repair %s automatically (%s): run  shipm sync --repair-hooks  in a terminal" % (sp, e))
+
+
+def main():
+    try:
+        return _main()
+    finally:
+        if _BASE is not None and not _GUARD_DONE:      # the run ended abnormally (exception): the real files are still checked and cleaned
+            changed = guard_diff(_BASE, fingerprint(), [])
+            if changed:
+                print("\nFAIL test-all: a test changed a real file: %s (the run ended abnormally)" % ", ".join(changed))
+                clean_real_settings(changed)
+
+
+sys.exit(main())

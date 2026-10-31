@@ -1,0 +1,105 @@
+{
+ "agents": {
+  "design": "designer",
+  "do": "builder",
+  "plan": "planner",
+  "review": "reviewer",
+  "scope": "scoper",
+  "verify": "verifier"
+ },
+ "checks": [
+  "tests",
+  "lint",
+  "criteria",
+  "screens 375/768/1280",
+  "contrast 4.5",
+  "focus",
+  "rtl"
+ ],
+ "dep_files": [
+  "package.json",
+  "*lock*",
+  "requirements*.txt",
+  "pyproject.toml",
+  "Pipfile*",
+  "poetry.lock",
+  "uv.lock",
+  "Package.swift",
+  "Package.resolved",
+  "Podfile*",
+  "go.mod",
+  "go.sum",
+  "Cargo.*",
+  "Gemfile*",
+  "composer.json",
+  "build.gradle*",
+  "pom.xml"
+ ],
+ "fast_limit": {
+  "max_files": 3,
+  "max_lines": 50
+ },
+ "labels": {
+  "approve": "OK",
+  "deliver": "Release",
+  "do": "Build",
+  "intake": "Request",
+  "learn": "Learn",
+  "plan": "Plan",
+  "review": "Review",
+  "scope": "Scope",
+  "verify": "Test"
+ },
+ "lane": {
+  "default": "fast",
+  "fast_allowed": true
+ },
+ "review": {
+  "always": [],
+  "full": [
+   "correctness"
+  ],
+  "on_risk": [
+   "risk"
+  ],
+  "on_ui": [
+   "design"
+  ]
+ },
+ "risk_paths_default": [
+  "**/auth/**",
+  "**/security/**",
+  "**/*secret*",
+  "**/.env*",
+  "**/migrations/**",
+  "**/payments/**",
+  ".github/workflows/**",
+  "**/Dockerfile",
+  "**/infra/**",
+  "**/deploy/**"
+ ],
+ "roles": {
+  "approve": "owner",
+  "deliver": "lead",
+  "design": "design",
+  "do": "build",
+  "learn": "lead",
+  "plan": "plan",
+  "review": "review",
+  "scope": "scope",
+  "verify": "test"
+ },
+ "skips": {
+  "fast": [
+   "scope",
+   "plan",
+   "approve",
+   "review"
+  ]
+ },
+ "type": "app",
+ "ui_paths": [
+  "**/*.{tsx,jsx,css,scss,html,vue,svelte,swift}"
+ ],
+ "v": 1
+}

@@ -1,0 +1,17 @@
+{
+ "prompt_id": "c0f1772f-91d4-479a-8fca-e8a1485f34d8",
+ "permission_mode": "acceptEdits",
+ "agent_id": "a5e2dadedba59dcae",
+ "agent_type": "qa-engineer",
+ "effort": {
+  "level": "medium"
+ },
+ "hook_event_name": "PreToolUse",
+ "tool_name": "Bash",
+ "tool_input": {
+  "command": "<47 chars>"
+ },
+ "tool_use_id": "toolu_01SaGk3datUhf4eMfMaQ2Ayo",
+ "session_id": "SESSION",
+ "cwd": "PROJECT"
+}

@@ -1,0 +1,27 @@
+{
+ "_comment": "P5 T4: paths under <project>/.shipmiracle are gate-controlled (placeholder {P} = project folder, filled by tests/flow_gate_playbook_test.py)",
+ "protected": ["{P}/.shipmiracle/playbook.json", "{P}/.shipmiracle/work.json", "{P}/.shipmiracle/new_file.json", "{P}/.shipmiracle"],
+ "bash_writes": ["echo x > '{T}'", "cp /tmp/x '{T}'", "rm '{T}'", "sed -i '' s/a/b/ '{T}'", "mv /tmp/x '{T}'", "tee '{T}' < /tmp/x", "python3 -c \"open('{T}','w').write('x')\""],
+ "harmless": ["cat {P}/.shipmiracle/playbook.json", "ls {P}/.shipmiracle", "grep -n level {P}/.shipmiracle/work.json", "git status --short", "echo hello > /tmp/p5-harmless.txt", "echo x > /tmp/shipmiracle-notes.txt"],
+ "admin_denied": ["shipm playbook set level warn", "shipm playbook init --legacy --apply", "shipm playbook accept", "shipm cr abandon CR-001", "shipm cr advance CR-001 --stage plan --reason x",
+                  "~/Developer/AI-Workspace/bin/shipm playbook set level off", "env -u CLAUDECODE shipm cr abandon CR-001", "python3 -m shipmiracle playbook set level warn", "SHIPMIRACLE_TEST=1 shipm cr list",
+    "shipm playbook asset add scripts/x.sh --stage do --purpose p",
+    "/usr/bin/env shipm playbook asset remove scripts/x.sh",
+    "shipm release mark 1.2",
+    "shipm release mark 1.2 --date 2026-01-31 --push --project myapp",
+    "shipm --json release mark 2.0",
+    "bin/shipm release --project myapp mark 3.1",
+    "python3 bin/shipm playbook asset add a.sh --stage do --purpose p",
+    "sh -c 'shipm playbook asset add a.sh --stage do --purpose p'"
+  ],
+ "admin_allowed": ["shipm cr open 'a change'", "shipm cr list --json", "shipm cr show --next", "shipm cr delta CR-002 --from CR-003 --reset-to plan", "shipm cr render", "shipm cr start CR-002", "shipm playbook show", "shipm brief", "git commit -m 'docs: shipm cr abandon explained'", "grep -n 'shipm playbook set' README.md",
+    "shipm playbook asset list",
+    "shipm playbook asset list --json",
+    "shipm release status",
+    "shipm release status --project myapp --json",
+    "shipm release denylist",
+    "shipm release denylist --show-hashes",
+    "shipm release export --dry-run",
+    "git commit -m 'docs: shipm release mark 1.2 explained'"
+  ]
+}

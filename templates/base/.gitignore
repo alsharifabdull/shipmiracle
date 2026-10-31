@@ -1,0 +1,24 @@
+# secrets and local state
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.key
+.DS_Store
+
+# tool state (never commit agent sessions)
+.claude/settings.local.json
+
+# builds and deps
+node_modules/
+dist/
+build/
+.build/
+DerivedData/
+__pycache__/
+.venv/
+*.pyc
+.pytest_cache/
+coverage/
+.claude/_backup/

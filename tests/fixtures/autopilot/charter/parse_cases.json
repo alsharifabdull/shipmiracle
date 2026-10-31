@@ -1,0 +1,168 @@
+[
+ {
+  "name": "spec example",
+  "line": "charter: goal=\"fix login\"; scope=\"src/login/**, tests/login/**\"; budget=10%; time=3h; deps=none; ends=CR-012..CR-014",
+  "fields": {
+   "cmd": "set",
+   "goal": "fix login",
+   "scope": [
+    "src/login/**",
+    "tests/login/**"
+   ],
+   "ends": [
+    "CR-012",
+    "CR-013",
+    "CR-014"
+   ],
+   "budget": 10,
+   "time": 3,
+   "deps": {
+    "mode": "none"
+   }
+  }
+ },
+ {
+  "name": "minimal with defaults",
+  "line": "charter: goal=x; scope=a; ends=CR-001",
+  "fields": {
+   "cmd": "set",
+   "goal": "x",
+   "scope": [
+    "a"
+   ],
+   "ends": [
+    "CR-001"
+   ],
+   "budget": 10,
+   "time": 3,
+   "deps": {
+    "mode": "none"
+   }
+  }
+ },
+ {
+  "name": "minutes and a list of ends",
+  "line": "charter: goal=x; scope=a; ends=CR-001,CR-004; time=90m; budget=25%",
+  "fields": {
+   "cmd": "set",
+   "goal": "x",
+   "scope": [
+    "a"
+   ],
+   "ends": [
+    "CR-001",
+    "CR-004"
+   ],
+   "budget": 25,
+   "time": 1.5,
+   "deps": {
+    "mode": "none"
+   }
+  }
+ },
+ {
+  "name": "listed deps",
+  "line": "charter: goal=x; scope=a; ends=CR-001; deps=\"left-pad, @types/node\"",
+  "fields": {
+   "cmd": "set",
+   "goal": "x",
+   "scope": [
+    "a"
+   ],
+   "ends": [
+    "CR-001"
+   ],
+   "budget": 10,
+   "time": 3,
+   "deps": {
+    "mode": "listed",
+    "names": [
+     "left-pad",
+     "@types/node"
+    ]
+   }
+  }
+ },
+ {
+  "name": "off",
+  "line": "charter: off",
+  "fields": {
+   "cmd": "off"
+  }
+ },
+ {
+  "name": "show",
+  "line": "Charter: show",
+  "fields": {
+   "cmd": "show"
+  }
+ },
+ {
+  "name": "allow",
+  "line": "allow: H-1a2b3c",
+  "fields": {
+   "cmd": "allow",
+   "id": "H-1a2b3c"
+  }
+ },
+ {
+  "name": "not a charter line",
+  "line": "hello there",
+  "fields": null,
+  "error": null
+ },
+ {
+  "name": "second line is not a charter",
+  "line": "hello\ncharter: off",
+  "fields": null,
+  "error": null
+ },
+ {
+  "name": "budget over the cap",
+  "line": "charter: goal=x; scope=a; ends=CR-001; budget=26%",
+  "fields": null,
+  "error": "cap"
+ },
+ {
+  "name": "time not a multiple of 15 min",
+  "line": "charter: goal=x; scope=a; ends=CR-001; time=1.1h",
+  "fields": null,
+  "error": "15 minutes"
+ },
+ {
+  "name": "unknown key",
+  "line": "charter: goal=x; scope=a; ends=CR-001; mode=fast",
+  "fields": null,
+  "error": "unknown key"
+ },
+ {
+  "name": "unclosed quote",
+  "line": "charter: goal=\"x; scope=a; ends=CR-001",
+  "fields": null,
+  "error": "never closed"
+ },
+ {
+  "name": "scope escapes the project",
+  "line": "charter: goal=x; scope=a/../../b; ends=CR-001",
+  "fields": null,
+  "error": "'..'"
+ },
+ {
+  "name": "too many ends",
+  "line": "charter: goal=x; scope=a; ends=CR-001..CR-006",
+  "fields": null,
+  "error": "at most 5"
+ },
+ {
+  "name": "missing ends",
+  "line": "charter: goal=x; scope=a",
+  "fields": null,
+  "error": "missing ends"
+ },
+ {
+  "name": "allow with a wrong id",
+  "line": "allow: H-12",
+  "fields": null,
+  "error": "stop id"
+ }
+]

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# plugins-update — refresh the plugin marketplaces, then update every Claude plugin that is BOTH enabled and approved
+# (`claude plugin update` needs one plugin per call). Prints one line per plugin. Never fails the caller.
+# Approved = a line `- plugin <name>@<marketplace> | why` in the `## Approved plugins` section of skills/APPROVED.md.
+# FAIL CLOSED: a missing/unreadable list or a missing section updates nothing (one warn line). An enabled plugin that is not approved is not updated.
+WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LIST="$WS/skills/APPROVED.md"
+approved=$(python3 -I - "$LIST" <<'PYEOF'
+import re, sys
+try: lines = open(sys.argv[1], encoding="utf-8", errors="replace").read(2 * 1024 * 1024).splitlines()   # same read as skills.py _read: 2 MB cap, errors=replace
+except Exception: sys.exit(3)
+inside = found = False
+for l in lines:
+    if l.startswith("## "):                      # same section rule as skills.py _section: '## ' + title.strip() == 'Approved plugins'; the next '## ' ends it
+        if inside: break
+        inside = l[3:].strip() == "Approved plugins"; found = found or inside
+        continue
+    if not inside: continue
+    l = l.rstrip()
+    m = len(l) <= 1000 and re.match(r"^- plugin ([A-Za-z0-9][\w.-]*@[A-Za-z0-9][\w.-]*) \| (\S.*)$", l, re.ASCII)   # same strict line as skills.py PLUGIN_LINE_RE
+    if m: print(m.group(1))
+sys.exit(0 if found else 3)
+PYEOF
+)
+if [[ $? -ne 0 ]]; then
+  echo "  warn plugins: approved list unreadable or has no '## Approved plugins' section ($LIST); nothing updated -> shipm skills found"
+  exit 0
+fi
+claude plugin marketplace update >/dev/null 2>&1
+enabled=$(python3 -I -c '
+import json, pathlib
+try: d = json.loads((pathlib.Path.home()/".claude/settings.json").read_text())
+except Exception: raise SystemExit(3)
+print("\n".join(k for k, v in (d.get("enabledPlugins") or {}).items() if v))' 2>/dev/null) || { echo "  warn plugins: ~/.claude/settings.json unreadable; nothing updated"; exit 0; }
+while read -r p; do
+  [[ -n "$p" ]] || continue
+  if ! grep -qxF -- "$p" <<<"$approved"; then echo "  warn $p: not approved, not updated -> shipm skills found"; continue; fi
+  out=$(claude plugin update "$p" </dev/null 2>&1 | tail -1)
+  case "$out" in
+    *"already"*|*"up to date"*|*"latest"*) echo "  ok   $p (up to date)";;
+    *"pdated"*)                           echo "  ok   $p updated";;
+    *)                                    echo "  warn $p: $out";;
+  esac
+done <<<"$enabled"
+exit 0
