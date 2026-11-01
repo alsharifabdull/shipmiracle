@@ -38,7 +38,7 @@ from . import pushcheck
 
 GIT = "git"
 OVERLAY = "release/overlay/"
-INPUT_FILES = ("release/placeholders.txt", "release/fixtures-reviewed.txt", "release/closure-exempt.txt", "release/VERSION", "release/overlay/CHANGELOG.md")
+INPUT_FILES = ("release/placeholders.txt", "release/fixtures-reviewed.txt", "release/closure-exempt.txt", "release/website-fonts.sha256", "release/VERSION", "release/overlay/CHANGELOG.md")
 NOREPLY_RE = re.compile(r"^\d+\+([A-Za-z0-9-]+)@users\.noreply\.github\.com$")
 MAX_BLOB_TOTAL = 256 * 1024 * 1024
 SHOW_LIMIT = 40

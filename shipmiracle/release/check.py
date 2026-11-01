@@ -27,10 +27,140 @@ from . import denylist as dl
 
 MAX_FILE = 320 * 1024                     # raised from 200 KB on 24 Oct 2026 (DECISIONS): the flow gate source (shipmiracle/hooks/flow.py) carries the isolation rules
 NUL_WINDOW = 8192
-# Brand pictures and the README pictures are the only binary files that may ship: PNG / ICO under brand/ (CHECKLIST L2), PNG in docs/images/, and only when the whole file is plain picture data:
+# Brand pictures and the README pictures are the only binary files that may ship: PNG / ICO under brand/ (CHECKLIST L2), PNG and GIF in docs/images/, and only when the whole file is plain picture data:
 # a PNG may hold only IHDR, PLTE, tRNS, IDAT and IEND chunks (CRC valid, IHDR first, IEND last, NOTHING after it), so no text/EXIF chunk or appended bytes can carry a
 # value past the scan; an ICO must have its directory and every image inside the file, each image a strict PNG or a BMP whose size matches its header, and no trailing bytes.
-BINARY_OK = re.compile(r"^(?:brand/(?:[^/]+/)?[^/]+\.(?:png|ico)|docs/images/[^/]+\.png)\Z")   # \Z, not $ ($ also matches before a trailing newline in the name); + the README pictures (docs/images/*.png, DECISIONS 2026-10-31): same strict PNG rule
+BINARY_OK = re.compile(r"^(?:brand/(?:[^/]+/)?[^/]+\.(?:png|ico)|docs/images/[A-Za-z0-9_-]+\.(?:png|gif)|website/assets/[^/]+\.(?:png|ico))\Z")   # \Z, not $ ($ also matches before a trailing newline in the name); + the README pictures (docs/images/<A-Za-z0-9_->.png, DECISIONS 2026-10-31): same strict PNG rule, plain names only; + the animated README header (docs/images/*.gif, DECISIONS 2026-11-01): the strict GIF rule gif_clean; + the website pictures (website/assets/*.png|ico, DECISIONS 2026-10-31): same strict PNG / ICO rule
+# The website fonts (website/assets/fonts/*.woff2, DECISIONS 2026-10-31 and 2026-11-01) are the only font files that may ship, under their own strict rule. STRUCTURE (woff2_clean): the 48-byte header
+# is complete, the file starts with the WOFF2 magic, the header length field (bytes 8..12, big-endian) equals the real file length, the reserved field is 0, and metaOffset, metaLength, metaOrigLength,
+# privOffset and privLength are all 0 (no metadata block and no private block, the two places a header-correct file could carry free text), and the file is at most 200 KB. The length check catches
+# appended or cut bytes; it does NOT look inside the compressed tables. So (1) the secret scanners (_SPECIFIC, SECRET_RE, the home-path regex) also run over the raw bytes of a font that passed the structure
+# check (finds clear text hiding in a header-correct file; text inside the brotli stream cannot be seen this way), and (2) every font must be pinned by sha256 in the reviewed list
+# release/website-fonts.sha256 ('unreviewed_font' otherwise): the hash pin is the real control, the scans are a second net. Anything else is a binary finding.
+WOFF2_OK = re.compile(r"^website/assets/fonts/[^/]+\.woff2\Z")
+WOFF2_MAX = 200 * 1024
+# website/ (the folder ships into a PUBLIC repo): exactly these names may exist; everything else (dotfiles, *.map, *.sh, *.dat, unknown names, other folders) is a 'website_unknown' finding.
+# This mirrors the website/ patterns of release/allowlist.txt (defence in depth for the exported tree, whose allowlist is not consulted by release-check). Case-sensitive on purpose: F.WOFF2 is unknown.
+WEBSITE_OK = re.compile(r"^website/(?:[A-Za-z0-9_-]+\.(?:html|css|js)|robots\.txt|CNAME|README\.md|assets/[A-Za-z0-9_-]+\.(?:svg|png|ico)|assets/fonts/[A-Za-z0-9_-]+\.woff2|assets/fonts/OFL-geist\.txt)\Z")
+# an SVG under website/ is a picture, not a program: no script element, no javascript: URL, no on...= event attribute, no foreignObject
+SVG_ACTIVE = re.compile(r"<\s*script|javascript\s*:|\bon[a-z]+\s*=|<\s*foreignObject", re.I)
+
+
+# The animated README header (docs/images/*.gif, DECISIONS 2026-11-01) is a GIF under a STRICT structure rule (gif_clean), like the PNG rule. A GIF is accepted only when it is exactly what ffmpeg writes: GIF89a (or GIF87a),
+# a logical screen descriptor (1..4096 px each way) with an optional global colour table, then ONLY image descriptors (optional local colour table, LZW minimum code size 2..8, data sub-blocks that end with a 0 length and stay
+# inside the file), graphic control extensions (block size 4) and ONE application extension that is exactly NETSCAPE2.0 (the loop count). Comment, plain-text, XMP and every other extension, every unknown block byte, a missing
+# trailer and any byte after the one 0x3B trailer are refused; at most 400 frames and 6 MB. The LZW pixel data is compressed, so the secret scanners cannot read it: this rule is structural only and the pixels are covered
+# by CHECKLIST H14 (frame-by-frame review before export). There is no hash pin (the file changes with every edit); instead at most GIF_MAX_FILES gifs may exist under docs/images ('too_many_gifs').
+GIF_OK = re.compile(r"^docs/images/[A-Za-z0-9_-]+\.gif\Z")      # plain stem: no space, newline, control or bidi character in a picture name
+GIF_MAX = 6 * 1024 * 1024
+GIF_MAX_FRAMES = 400
+GIF_MAX_DIM = 4096
+GIF_MAX_FILES = 3
+# A GIF is also refused when ANY byte run of it is a signature of another file format or of active text (polyglot: a GIF that is also a zip, a page or a PDF). Searched over the whole file, tags case-insensitive.
+# The 4-byte PK signatures can hit random LZW data by chance (about 0.07 % per signature for a 3 MB file); a chance hit means the GIF must be re-encoded.
+GIF_POLY_RAW = (b"PK\x03\x04", b"PK\x05\x06")
+GIF_POLY_TAGS = (b"<script", b"<html", b"<svg", b"%pdf-")
+
+
+def gif_clean(d):
+    """True only for a strict GIF (see GIF_OK comment): ffmpeg-style blocks only, NETSCAPE2.0 as the only extension with free data, one trailer and no byte after it; any parse problem returns False."""
+    try:
+        return _gif_walk(d)
+    except Exception:       # fail closed: a parser slip on hostile bytes is a refusal, never an exception out of the check
+        return False
+
+
+def _gif_subblocks(d, p):
+    """Skip a sub-block chain that starts at p; return the offset after its 0 terminator, or -1 if it runs past the end of the file."""
+    n = len(d)
+    while True:
+        if p >= n:
+            return -1
+        ln = d[p]
+        p += 1
+        if ln == 0:
+            return p
+        p += ln
+        if p > n:
+            return -1
+
+
+def _gif_walk(d):
+    n = len(d)
+    if n < 14 or n > GIF_MAX or d[:6] not in (b"GIF89a", b"GIF87a"):
+        return False
+    if any(sig in d for sig in GIF_POLY_RAW):
+        return False
+    low = d.lower()
+    if any(sig in low for sig in GIF_POLY_TAGS):
+        return False
+    w, h = int.from_bytes(d[6:8], "little"), int.from_bytes(d[8:10], "little")
+    if not (1 <= w <= GIF_MAX_DIM and 1 <= h <= GIF_MAX_DIM):
+        return False
+    p = 13
+    if d[10] & 0x80:
+        p += 3 * (1 << ((d[10] & 7) + 1))
+    frames = gces = apps = 0
+    while True:
+        if p >= n:
+            return False                                    # no trailer
+        b = d[p]
+        p += 1
+        if b == 0x3B:
+            return p == n and frames >= 1                   # exactly one trailer, nothing after it
+        if b == 0x2C:
+            if p + 9 > n:
+                return False
+            left, top = int.from_bytes(d[p:p + 2], "little"), int.from_bytes(d[p + 2:p + 4], "little")
+            fw, fh = int.from_bytes(d[p + 4:p + 6], "little"), int.from_bytes(d[p + 6:p + 8], "little")
+            packed = d[p + 8]
+            p += 9
+            if fw < 1 or fh < 1 or left + fw > w or top + fh > h:
+                return False                                # a frame must lie inside the canvas
+            if packed & 0x80:
+                p += 3 * (1 << ((packed & 7) + 1))
+            if p >= n or not 2 <= d[p] <= 8:
+                return False                                # LZW minimum code size
+            p = _gif_subblocks(d, p + 1)
+            if p < 0:
+                return False
+            frames += 1
+            if frames > GIF_MAX_FRAMES:
+                return False
+        elif b == 0x21:
+            if p >= n:
+                return False
+            label = d[p]
+            p += 1
+            if label == 0xF9:                               # graphic control extension: size 4, then the terminator
+                if p + 6 > n or d[p] != 4 or d[p + 5] != 0:
+                    return False
+                p += 6
+                gces += 1
+                if gces > GIF_MAX_FRAMES:
+                    return False
+            elif label == 0xFF:                             # application extension: ONLY NETSCAPE2.0, before the first frame, once
+                if p + 17 > n or d[p] != 11 or d[p + 1:p + 12] != b"NETSCAPE2.0" or d[p + 12] != 3 or d[p + 13] != 1 or d[p + 16] != 0:
+                    return False
+                apps += 1
+                if apps > 1 or frames:
+                    return False
+                p += 17
+            else:
+                return False                                # comment, plain text, XMP and every other extension label
+        else:
+            return False                                    # unknown block byte
+
+
+def woff2_clean(d):
+    """True only for a WOFF2 file with a complete 48-byte header, the right magic, a length field equal to the real length, reserved 0, no metadata and no private block (all five fields 0), and at most WOFF2_MAX bytes."""
+    import struct
+    if len(d) < 48 or len(d) > WOFF2_MAX or not d.startswith(b"wOF2") or int.from_bytes(d[8:12], "big") != len(d):
+        return False
+    (_flavor, _length, _ntab, reserved, _sfnt, _comp, _maj, _min, meta_off, meta_len, meta_orig, priv_off, priv_len) = struct.unpack(">IIHHIIHHIIIII", d[4:48])
+    return reserved == 0 and not (meta_off or meta_len or meta_orig or priv_off or priv_len)
+
+
 _MAGIC = {"png": b"\x89PNG\r\n\x1a\n", "ico": b"\x00\x00\x01\x00"}
 _PNG_CHUNKS = (b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND")
 
@@ -91,7 +221,9 @@ def ico_clean(d):
 
 
 def brand_image_clean(rel, d):
-    return bool(BINARY_OK.match(rel)) and (png_clean(d) if rel.endswith(".png") else ico_clean(d))
+    if not BINARY_OK.match(rel):
+        return False
+    return png_clean(d) if rel.endswith(".png") else gif_clean(d) if rel.endswith(".gif") else ico_clean(d)
 MAX_DEPTH = 64
 BUDGET = 1 << 30
 CHECKS = ("secrets/builtin", "secrets/gitleaks", "identifier", "home-path", "filetype", "fixtures", "closure", "isolation", "legacy_name", "version")
@@ -101,6 +233,7 @@ HANDLE_FILES = ("LICENSE", "README", "SECURITY", "CONTRIBUTING")
 LOGIN_EXEMPT = {
     "LICENSE": "DECISIONS 2026-10-21, D1 (license holder is the public login)",
     "README.md": "DECISIONS 2026-10-27, owner (D1 login in the overlay files)",
+    "website/index.html": "DECISIONS 2026-10-31, owner: website links to the public repo",
     ".github/CODEOWNERS": "DECISIONS 2026-10-27, owner (D1 login in the overlay files)",
     ".github/ISSUE_TEMPLATE/config.yml": "DECISIONS 2026-10-27, owner (D1 login in the overlay files)",
 }
@@ -122,6 +255,9 @@ _SPECIFIC = re.compile("|".join([
     r"(?P<google_api_key>AIza[0-9A-Za-z_-]{35})",
 ]))
 _HOME_RE = re.compile(r"/users/(<[A-Za-z_-]+>|\$\{?[A-Za-z_]+\}?|[A-Za-z0-9._@+~-]+)", re.I)
+# website/ only (DECISIONS 2026-11-01): a Linux home path /home/<name>/ and a ~<name> home shorthand are home paths too. Not applied tree-wide: the shipped tests use /home/u/ and /home/me/ as fake paths.
+_HOME_LINUX_RE = re.compile(r"(?<![\w.])/home/([A-Za-z0-9._-]+)/", re.I)
+_HOME_TILDE_RE = re.compile(r"(?<![\w~$/.-])~([A-Za-z_][A-Za-z0-9_-]*)")       # text only: in compressed font bytes a '~' followed by a letter is just noise
 _ANCHOR = r"(?:@SHIPMIRACLE_ENGINE@|\$\{?(?:SHIPMIRACLE_ENGINE|ENGINE|WS|SHIPMIRACLE_WS|ENGINE_DIR)\}?)/"
 _BIN_RE = re.compile(r"(?:(?<![\w.~/$@-])(?:\./)?|" + _ANCHOR + r")bin/([A-Za-z0-9][\w.+-]*)")
 _SH_RE = re.compile(r"(?:(?<![\w.~/$@-])(?:\./)?|" + _ANCHOR + r")hooks/([A-Za-z0-9][\w.-]*\.sh)\b")
@@ -159,9 +295,10 @@ def _clean(s):
 class Inputs(object):
     """Everything release-check reads besides the tree. None = not available yet (that check prints a SKIP line)."""
 
-    def __init__(self, placeholders=None, fixtures=None, version=None, changelog=None, notes=None, closure_exempt=None):
+    def __init__(self, placeholders=None, fixtures=None, version=None, changelog=None, notes=None, closure_exempt=None, fonts=None):
         self.placeholders = placeholders        # set of strings, or None (built-in list used)
         self.fixtures = fixtures                # {path: sha256}, or None
+        self.fonts = fonts                      # {path: sha256} reviewed website fonts (release/website-fonts.sha256), or None (= every font is unreviewed)
         self.version = version                  # text of release/VERSION, or None
         self.changelog = changelog              # text of the overlay CHANGELOG, or None
         self.notes = notes or {}                # check -> why an input is missing
@@ -189,6 +326,11 @@ def load_inputs(release_dir) -> Inputs:
         inp.notes["fixtures"] = "release/fixtures-reviewed.txt not found"
     else:
         inp.fixtures = parse_fixtures(t)
+    t = _read_text(rd / "website-fonts.sha256") if rd else None
+    if t is None:
+        inp.notes["fonts"] = "release/website-fonts.sha256 not found"
+    else:
+        inp.fonts = parse_fixtures(t, "website-fonts.sha256")
     t = _read_text(rd / "VERSION") if rd else None
     if t is None:
         inp.notes["version"] = "release/VERSION not found"
@@ -214,10 +356,11 @@ def load_inputs_for_tree(tree, release_dir) -> Inputs:
     out = Inputs(placeholders=mine.placeholders if mine.placeholders is not None else base.placeholders,
                  fixtures=mine.fixtures if mine.fixtures is not None else base.fixtures,
                  version=mine.version if mine.version is not None else base.version,
+                 fonts=mine.fonts if mine.fonts is not None else base.fonts,
                  changelog=base.changelog,
                  closure_exempt=mine.closure_exempt if (tr / "closure-exempt.txt").is_file() else base.closure_exempt)
     for k, v in base.notes.items():
-        if (k == "home-path" and out.placeholders is not None) or (k == "fixtures" and out.fixtures is not None) or (k == "version" and out.version is not None):
+        if (k == "home-path" and out.placeholders is not None) or (k == "fixtures" and out.fixtures is not None) or (k == "version" and out.version is not None) or (k == "fonts" and out.fonts is not None):
             continue
         out.notes[k] = v
     return out
@@ -238,14 +381,14 @@ def parse_closure_exempt(text):
     return out
 
 
-def parse_fixtures(text):
+def parse_fixtures(text, name="fixtures-reviewed.txt"):
     out = {}
     for n, line in enumerate(text.splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.strip().split(None, 1)
         if len(parts) != 2 or not re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
-            raise UsageError("fixtures-reviewed.txt line %d is not '<sha256> <path>'" % n)
+            raise UsageError("%s line %d is not '<sha256> <path>'" % (name, n))
         out[parts[1].strip()] = parts[0].lower()
     return out
 
@@ -431,6 +574,7 @@ def scan(tree, inputs=None, deny=None, deny_required=False, require_gitleaks=Fal
     order = [""]
     stack = [("", 0)]
     spent = 0
+    n_read_gif = 0
     while stack:
         drel, depth = stack.pop()
         dpath = os.path.join(root, drel) if drel else root
@@ -481,11 +625,19 @@ def scan(tree, inputs=None, deny=None, deny_required=False, require_gitleaks=Fal
             if not stat.S_ISREG(mode):
                 F.append(Finding("filetype", "special_file", disp(rel), 0, 0))
                 continue
+            is_g = bool(GIF_OK.match(rel))
+            if is_g:
+                n_read_gif += 1
+                if n_read_gif > GIF_MAX_FILES:
+                    continue                    # more than GIF_MAX_FILES gifs: not read (the too_many_gifs finding below fails the check anyway)
             _file(rel, name, e.path, st, root, dir_entries[drel], F, disp, matcher, placeholders, inputs, refs, fixtures_seen,
                   budget=BUDGET - spent)
-            spent += min(st.st_size, MAX_FILE)
+            spent += min(st.st_size, GIF_MAX if is_g else MAX_FILE)
             if name == ".gitmodules":
                 F.append(Finding("filetype", "submodule", disp(rel), 0, 0))
+    n_gif = sum(1 for f_ in files if GIF_OK.match(f_))
+    if n_gif > GIF_MAX_FILES:
+        F.append(Finding("filetype", "too_many_gifs", None, note="%d gifs under docs/images, at most %d may ship" % (n_gif, GIF_MAX_FILES)))
     # tree sha, children before parents
     shas = {}
     for drel in reversed(order):
@@ -611,6 +763,24 @@ def _line_text(text, off):
     return text[a:b if b >= 0 else len(text)]
 
 
+_ASCII_ONLY = bytes(c if 0x20 <= c < 0x7F or c in (9, 10, 13) else 0x20 for c in range(256))
+
+
+def _raw_scan(data, d, placeholders, F):
+    """The secret and home-path scanners over the raw bytes of a binary picture or font (1 byte = 1 char: a token or path in clear inside any table or sub-block is found)."""
+    raw = data.decode("latin-1")
+    for m in _SPECIFIC.finditer(raw):
+        F.append(Finding("secrets/builtin", m.lastgroup, d, 0, 0))
+    for m in SECRET_RE.finditer(raw):
+        F.append(Finding("secrets/builtin", _classify_generic(m.group(0)), d, 0, 0))
+    for m in _HOME_RE.finditer(raw):
+        if m.group(1).lower() not in placeholders:
+            F.append(Finding("home-path", "home_path", d, 0, 0))
+    for m in _HOME_LINUX_RE.finditer(raw):
+        if m.group(1).lower() not in placeholders:
+            F.append(Finding("home-path", "home_path", d, 0, 0))
+
+
 def _file(rel, name, path, st, root, ents, F, disp, matcher, placeholders, inputs, refs, fixtures_seen, budget):
     d = disp(rel)
     if LEGACY_RE.search(rel):
@@ -620,6 +790,8 @@ def _file(rel, name, path, st, root, ents, F, disp, matcher, placeholders, input
         F.append(Finding("filetype", fk, d, 0, 0))
     if st.st_mode & 0o111 and not EXEC_OK.match(rel):
         F.append(Finding("filetype", "exec_bit", d, 0, 0))
+    if rel.startswith("website/") and not WEBSITE_OK.match(rel):
+        F.append(Finding("filetype", "website_unknown", d, 0, 0))
     want_sha256 = rel.startswith("tests/fixtures/")
     size = st.st_size
     try:
@@ -628,6 +800,8 @@ def _file(rel, name, path, st, root, ents, F, disp, matcher, placeholders, input
         F.append(Finding("filetype", "unreadable", d, 0, 0))
         return
     data = b""
+    is_gif = bool(GIF_OK.match(rel))
+    cap = GIF_MAX if is_gif else MAX_FILE         # only a GIF under docs/images may be larger than MAX_FILE (animation), up to GIF_MAX
     try:
         h1 = hashlib.sha1(b"blob %d\0" % size)
         h256 = hashlib.sha256() if want_sha256 else None
@@ -641,8 +815,8 @@ def _file(rel, name, path, st, root, ents, F, disp, matcher, placeholders, input
                 h1.update(chunk)
                 if h256:
                     h256.update(chunk)
-                if len(data) < MAX_FILE + 1:
-                    data += chunk[:MAX_FILE + 1 - len(data)]
+                if len(data) < cap + 1:
+                    data += chunk[:cap + 1 - len(data)]
     except OSError:
         F.append(Finding("filetype", "unreadable", d, 0, 0))
         return
@@ -650,11 +824,35 @@ def _file(rel, name, path, st, root, ents, F, disp, matcher, placeholders, input
         ents.append((os.fsencode(name), b"100755" if st.st_mode & 0o100 else b"100644", h1.digest()))
     if h256:
         fixtures_seen[rel] = h256.hexdigest()
-    if size > MAX_FILE:
+    if size > cap:
         F.append(Finding("filetype", "too_large", d, 0, 0))
         return
     if budget <= 0:
         F.append(Finding("filetype", "scan_budget_exceeded", d, 0, 0))
+        return
+    if is_gif:                                  # an animated header is judged by the strict GIF rule (fail closed, with or without a NUL byte); the LZW pixels cannot be read, every other byte is text-scanned (_raw_scan + the denylist)
+        if not gif_clean(data):
+            F.append(Finding("filetype", "binary", d, 0, 0))
+            return
+        _raw_scan(data, d, placeholders, F)
+        if matcher:                             # ASCII projection: bytes >= 0x80 and NUL become spaces, so random pixel bytes cannot grow into letters through NFKC; clear text hidden in a sub-block or table is ASCII
+            nt = data.translate(_ASCII_ONLY).decode("ascii").lower()
+            for kind, h, off in matcher.search_norm(nt):
+                if kind == "handle" and handle_allowed(rel):
+                    continue
+                if rel in LOGIN_EXEMPT and (kind, h) in matcher.login_hashes:
+                    matcher.login_used.add(rel)
+                    continue
+                F.append(Finding("identifier", kind, d, 0, 0, h))
+        return
+    if WOFF2_OK.match(rel):                     # a font under website/assets/fonts is judged by the strict WOFF2 rule (fail closed, with or without a NUL byte), then pinned by hash, then scanned as raw bytes
+        if not woff2_clean(data):
+            F.append(Finding("filetype", "binary", d, 0, 0))
+            return
+        pinned = inputs.fonts.get(rel) if inputs.fonts is not None else None
+        if pinned != hashlib.sha256(data).hexdigest():
+            F.append(Finding("filetype", "unreviewed_font", d, 0, 0))
+        _raw_scan(data, d, placeholders, F)
         return
     if b"\0" in data[:NUL_WINDOW]:
         if size <= MAX_FILE and brand_image_clean(rel, data):
@@ -662,6 +860,8 @@ def _file(rel, name, path, st, root, ents, F, disp, matcher, placeholders, input
         F.append(Finding("filetype", "binary", d, 0, 0))
         return
     text = data.decode("utf-8", "replace")
+    if rel.startswith("website/") and rel.lower().endswith(".svg") and SVG_ACTIVE.search(text):
+        F.append(Finding("filetype", "svg_active", d, *_lc(text, SVG_ACTIVE.search(text).start())))
     for m in LEGACY_RE.finditer(text):
         line, col = _lc(text, m.start())
         F.append(Finding("legacy_name", "old_name", d, line, col))
@@ -680,10 +880,16 @@ def _file(rel, name, path, st, root, ents, F, disp, matcher, placeholders, input
             if who not in placeholders:
                 line, col = _lc(text, m.start())
                 F.append(Finding("home-path", "home_path", d, line, col))
+    if rel.startswith("website/"):
+        for rx in (_HOME_LINUX_RE, _HOME_TILDE_RE):
+            for m in rx.finditer(text):
+                if m.group(1).lower() not in placeholders:
+                    line, col = _lc(text, m.start())
+                    F.append(Finding("home-path", "home_path", d, line, col))
     for kind, line, col in isolation_issues(rel, text):
         F.append(Finding("isolation", kind, d, line, col))
     # closure candidates
-    if ("bin/" in text or "hooks/" in text or "docs/" in text) and rel not in ("release/closure-exempt.txt", "release/fixtures-reviewed.txt", "release/placeholders.txt"):
+    if ("bin/" in text or "hooks/" in text or "docs/" in text) and rel not in ("release/closure-exempt.txt", "release/fixtures-reviewed.txt", "release/placeholders.txt", "release/website-fonts.sha256"):
         ex_here = any(e[0] == rel for e in inputs.closure_exempt)
         lt = (lambda m: _line_text(text, m.start())) if ex_here else (lambda m: None)
         for m in _BIN_RE.finditer(text):

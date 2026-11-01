@@ -142,9 +142,9 @@ check("no placeholder picture is allowed any more: every picture the README show
 _readme_body = re.sub(r"<!--.*?-->", "", texts.get("README.md", ""), flags=re.S)
 _shipped = sorted(p.name for p in (BASE / "docs" / "images").glob("*") if p.is_file())
 _unused = [n for n in _shipped if "docs/images/" + n not in _readme_body]
-check("docs/images holds %d pictures and the README uses every one (no orphan picture ships)" % len(_shipped), len(_shipped) >= 10 and not _unused, _unused)
+check("docs/images holds %d pictures and the README uses every one (no orphan picture ships)" % len(_shipped), len(_shipped) >= 9 and not _unused, _unused)
 _big = [n for n in _shipped if (BASE / "docs" / "images" / n).stat().st_size > 320 * 1024]
-check("every README picture is a PNG under release-check's 320 KB file limit", all(n.endswith(".png") for n in _shipped) and not _big, _big)
+check("every README picture is a PNG under release-check's 320 KB file limit, except the one strict-clean animated header.gif", all(n.endswith(".png") or n == "header.gif" for n in _shipped) and not [n for n in _big if n != "header.gif"], _big)
 check("the how-it-works diagram files exist", all((BASE / "docs" / "assets" / f).is_file() for f in ("how-it-works-light.svg", "how-it-works-dark.svg")))
 
 markers = sum(t.count("OWNER-CONFIRM") for t in texts.values())      # the README's first comment is a maintainer note and does not use the marker word
@@ -183,7 +183,27 @@ _BANNED = [r"not verified", r"\bverified\b", r"\bunverified\b", r"\btesters?\b",
            r"runs on your mac", r"not yet been installed", r"until a stranger"]
 _hits = [b for b in _BANNED if re.search(b, _readme_body, re.I)]
 check("README has no tester / invite / verified wording, no 'runs on your Mac' and no old slogan sentence", not _hits, _hits)
-check("README names the headline, the ten roles and the 44 features in 7 groups", "Claude Code, now with a team." in _readme_body and _readme_body.count("<details>") == 7 + 5
+# Positioning (owner decision 31 Oct 2026): the product manages and organizes ALL your AI projects; the old headline "Claude Code, now with a team." is retired.
+# The headline is set inside the light-only header picture, so it is the first words of that picture's alt text; there is no second h1 and no dark header.
+_hdr = re.findall(r"<img\b[^>]*docs/images/header\.gif[^>]*>", _readme_body)
+import html as _html  # noqa: E402
+_hdr_alt = _html.unescape(re.search(r'alt="([^"]*)"', _hdr[0]).group(1)) if len(_hdr) == 1 else ""
+_hdr_gif = BASE / "docs" / "images" / "header.gif"
+_hdr_bytes = _hdr_gif.read_bytes() if _hdr_gif.is_file() else b""
+check("README header: exactly one reference to docs/images/header.gif, a single <img> (no <picture>/dark source), width 100%, alt (one paragraph) names the headline and the subline",
+      len(_hdr) == 1 and 'width="100%"' in _hdr[0] and _hdr_gif.is_file() and "All your AI projects, organized." in _hdr_alt
+      and "One place to start, track and finish every project you build with AI agents." in _hdr_alt and "\n" not in _hdr_alt
+      and "<picture>" not in _readme_body.split("</p>", 1)[0] and "srcset" not in _readme_body.split("</p>", 1)[0], (len(_hdr), _hdr_alt[:80]))
+sys.path.insert(0, str(ROOT))
+from shipmiracle.release import check as _chk  # noqa: E402
+check("the animated header passes the strict gif_clean rule and is at most 4.5 MB", _chk.gif_clean(_hdr_bytes) and 0 < len(_hdr_bytes) <= 4.5 * 1024 * 1024, len(_hdr_bytes))
+check("the old still header.png is gone (the GIF is the only header picture)", not (BASE / "docs" / "images" / "header.png").exists() and "header.png" not in _readme_body)
+check("old banners are gone: no banner-*.png in docs/images or in the README, and the old headline is retired",
+      not list((BASE / "docs" / "images").glob("banner*")) and "banner" not in _readme_body and "now with a team" not in _readme_body.lower() and "<h1" not in _readme_body, "banner or old headline left")
+check("README intro says it manages and organizes all your AI projects (plans, approvals, memory, status)",
+      "Shipmiracle keeps every project you build with AI agents in one VS Code panel, with plans, approvals, memory and status for each project." in _readme_body
+      and "One place for every project." in _readme_body)
+check("README names the ten roles and the 44 features in 7 groups", _readme_body.count("<details>") == 7 + 5
       and sum(1 for ln in _readme_body.splitlines() if re.match(r"\| \*\*.+\*\* \|", ln)) == 44, (_readme_body.count("<details>"),))
 check("README says it runs locally on macOS, Linux and WSL 2 with Linux and WSL 2 experimental", "Runs locally on macOS, Linux and Windows (through WSL 2); Linux and WSL 2 are experimental." in _readme_body)
 check("README's three shipm install commands are the documented ones", re.search(r"git clone https://github\.com/[A-Za-z0-9-]+/shipmiracle ~/Developer/shipmiracle\ncd ~/Developer/shipmiracle\n\./bin/shipm init\n", _readme_body) is not None)   # no literal login here: the login is allowed only in README/LICENSE/.github, not in tests

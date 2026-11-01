@@ -1,14 +1,9 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/banner-dark-1280x320.png">
-    <img alt="Shipmiracle: Ship it with miracles. A porcelain app icon with a graphite S and an amber four-point star, next to the name." src="docs/images/banner-1280x320.png" width="100%">
-  </picture>
+  <img alt="Animated header for Shipmiracle: the headline &quot;All your AI projects, organized.&quot; appears word by word, followed by the line &quot;One place to start, track and finish every project you build with AI agents.&quot; Beside it, a window of the Shipmiracle panel (demo data) plays a short walkthrough: a mouse pointer clicks Open on a waiting item and the Projects list scrolls down to a project card, a project's stage timeline slides in and scrolls, then the pointer clicks the Reports tab, presses the FAIL filter, clicks the Setup tab and scrolls the setup checklist, and finally clicks back to Projects. A caption in the window title bar changes with each view. The animation loops about every 12 seconds." src="docs/images/header.gif" width="100%">
 </p>
 
-<h1 align="center">Claude Code, now with a team.</h1>
-
 <p align="center">
-  <b>Shipmiracle gives every project a planner, builders, a verifier and a reviewer, in one VS Code panel.</b><br>
+  <b>Shipmiracle keeps every project you build with AI agents in one VS Code panel, with plans, approvals, memory and status for each project.</b><br>
   Free and open source. No API key. Runs locally on macOS, Linux and Windows (through WSL 2); Linux and WSL 2 are experimental.
 </p>
 
@@ -37,12 +32,12 @@
 
 ## Why Shipmiracle
 
-- **A team, not one chat.** A planner, builders, a verifier and a reviewer, each on the model that fits the job: Opus plans and reviews, Sonnet builds and tests, Haiku writes short summaries.
-- **You stay in control.** Plans wait for your OK. A public push or a deploy stops and asks. A build is not finished until a separate verifier has run the real tests.
-- **A new chat picks up where you stopped.** Handoff lives in plain files in your repo (`STATUS.md`, `DECISIONS.md` and `memory/`), with no hidden database.
-- **One panel for every project.** See what is running, what failed and what waits on you.
+- **One place for every project.** See what is running, what failed and what waits on you, across all your AI projects.
+- **Plans and approvals.** Plans wait for your OK. A public push or a deploy stops and asks. A build is not finished until a separate verifier has run the real tests.
+- **Memory per project.** A new chat picks up where you stopped. Handoff lives in plain files in your repo (`STATUS.md`, `DECISIONS.md` and `memory/`), with no hidden database.
+- **Agents with defined roles.** A planner, builders, a verifier and a reviewer, each on the model that fits the job: Opus plans and reviews, Sonnet builds and tests, Haiku writes short summaries.
 
-Shipmiracle drives the Claude Code you already use, with the login you already have. Its command is `shipm`.
+Shipmiracle works with the Claude Code you already use, with the login you already have. Its command is `shipm`.
 
 ## How it works
 
@@ -391,9 +386,9 @@ No. It runs locally and makes no network calls of its own. It runs `git`, `gh`, 
 </details>
 
 <details>
-<summary><b>Does it replace Claude Code?</b></summary>
+<summary><b>Do I still use Claude Code?</b></summary>
 
-No. It drives Claude Code and adds the team around it.
+Yes. Shipmiracle works with the Claude Code you already use. It keeps your AI projects organized, with plans, approvals, memory and status for each one.
 
 </details>
 

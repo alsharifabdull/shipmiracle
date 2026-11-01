@@ -8,7 +8,7 @@ Logo approved by the owner on 26 Oct 2026: S1 Sign-off S + A Twinkle star on a p
 | `icon/AppIcon-preview-1024.png` and `-dark-`, `-clear-`, `-tinted-` | composed previews of the four appearances | 1024 x 1024 |
 | `mark-only.svg`, `mark-only-dark.svg` | the icon as a flat tile, no filters | 1024 x 1024 |
 | `lockup-light.svg`, `lockup-dark.svg` | mark + "Shipmiracle", horizontal, transparent background | vector |
-| `banner-1280x320.png` / `.svg`, `banner-dark-1280x320.png` / `.svg` | README banner, mark + wordmark + tagline "Ship it with miracles." | 1280 x 320 |
+| `banner-1280x320.png` / `.svg`, `banner-dark-1280x320.png` / `.svg` | brand banner, mark + wordmark + tagline "Ship it with miracles." (the README no longer uses it: its header is the animated `docs/images/header.gif`, light only) | 1280 x 320 |
 | `social-preview-1280x640.png` / `.svg` | GitHub social preview, same lock-up, 40 px or more of margin on every side | 1280 x 640 |
 | `favicon.svg` | 16 px cut: bolder S with open counters, rounded 4-point star at least 5 px tall at 16 px | 64 unit grid |
 | `favicon-16.png`, `favicon-32.png`, `favicon.ico` (16 + 32, PNG inside) | rasters of the favicon cut, transparent corners | 16, 32 |

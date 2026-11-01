@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; img-src 'self'; font-src 'self'; style-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F4EFE6">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<title>Shipmiracle - All your AI projects, organized</title>
+<meta name="description" content="One place to start, track and finish every project you build with AI agents, with plans, approvals, memory and status for each. Free and open source, in one VS Code panel.">
+<link rel="canonical" href="https://shipmiracle.com/">
+<meta property="og:title" content="Shipmiracle - All your AI projects, organized">
+<meta property="og:description" content="One place to start, track and finish every project you build with AI agents, with plans, approvals, memory and status for each. Free and open source, in one VS Code panel.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://shipmiracle.com/">
+<meta property="og:image" content="https://shipmiracle.com/assets/og-social-preview.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="2400">
+<meta property="og:image:height" content="1260">
+<meta property="og:image:alt" content="All your AI projects, organized. The Shipmiracle panel in VS Code, shown with sample projects.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Shipmiracle - All your AI projects, organized">
+<meta name="twitter:description" content="One place to start, track and finish every project you build with AI agents, with plans, approvals, memory and status for each. Free and open source, in one VS Code panel.">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/assets/favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="/assets/apple-touch-icon-180.png">
+<link rel="preload" href="/assets/fonts/geist-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<script src="/theme.js"></script>
+<link rel="stylesheet" href="/styles.css">
+<script src="/site.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+<symbol id="i-github" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><path fill="currentColor" stroke="none" d="M12 1Q13.3 8.7 21.5 12Q13.3 15.3 12 23Q10.7 15.3 2.5 12Q10.7 8.7 12 1Z"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></symbol>
+<symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 8h16M4 16h16"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></symbol>
+<symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><circle cx="17" cy="9" r="2.5"/><path d="M17 14.5c2.2.3 4 2.3 4 4.5"/></symbol>
+<symbol id="i-flow" viewBox="0 0 24 24"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="9" r="2"/><path d="M6 7v10M18 11c0 4-4 4.5-9 5"/></symbol>
+<symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M9 9v11"/></symbol>
+<symbol id="i-memory" viewBox="0 0 24 24"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 13h7M9 17h5"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.2 7.8-8 9-4.8-1.2-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/></symbol>
+<symbol id="i-term" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 10l3 2-3 2M13 15h4"/></symbol>
+</svg>
+
+<header class="top">
+<div class="wrap top-in">
+<a class="brand" href="/" aria-label="Shipmiracle, home">
+<img class="logo logo-d" src="/assets/mark-only-dark.svg" alt="" width="28" height="28">
+<img class="logo logo-l" src="/assets/mark-only.svg" alt="" width="28" height="28">
+<span>Shipmiracle</span>
+</a>
+<nav aria-label="Page sections">
+<ul class="nav">
+<li><a href="#how">How it works</a></li>
+<li><a href="#team">Agents</a></li>
+<li><a href="#features">Features</a></li>
+<li><a href="#install">Install</a></li>
+</ul>
+</nav>
+<div class="top-cta">
+<a class="ib" href="https://github.com/alsharifabdull/shipmiracle" rel="noopener" aria-label="Shipmiracle on GitHub"><svg class="ico fill" aria-hidden="true"><use href="#i-github"/></svg></a>
+<button type="button" class="ib theme" aria-label="Switch to dark theme"><svg class="ico t-moon" aria-hidden="true"><use href="#i-moon"/></svg><svg class="ico t-sun" aria-hidden="true"><use href="#i-sun"/></svg></button>
+<a class="btn btn-sm btn-primary get" href="#install">Get started</a>
+<details class="m-menu">
+<summary aria-label="Menu"><svg class="ico" aria-hidden="true"><use href="#i-menu"/></svg></summary>
+<ul>
+<li><a href="#how">How it works</a></li>
+<li><a href="#team">Agents</a></li>
+<li><a href="#features">Features</a></li>
+<li><a href="#install">Install</a></li>
+</ul>
+</details>
+</div>
+</div>
+</header>
+
+<main id="main">
+
+<!-- HERO -->
+<section class="hero" aria-labelledby="hero-h">
+<div class="wrap hero-grid">
+<div class="hero-copy">
+<h1 id="hero-h">All your AI projects, <span class="hl">organized.<svg class="star" aria-hidden="true"><use href="#i-star"/></svg></span></h1>
+<p class="lead">One place to start, track and finish every project you build with AI agents.</p>
+<p class="cta">
+<a class="btn btn-lg btn-primary" href="#install">Get started</a>
+<a class="btn btn-lg" href="https://github.com/alsharifabdull/shipmiracle" rel="noopener"><svg class="ico fill" aria-hidden="true"><use href="#i-github"/></svg>Star on GitHub</a>
+</p>
+<ul class="fine">
+<li>Free</li>
+<li>MIT</li>
+<li>No API key</li>
+</ul>
+</div>
+
+<figure class="win hero-art" aria-label="The Shipmiracle panel in VS Code, shown with sample projects">
+<div class="win-bar" aria-hidden="true"><i class="live"></i>Shipmiracle panel in VS Code &middot; sample projects</div>
+<div class="pn" aria-hidden="true">
+<div class="pn-tabs"><span class="on">Projects<em>2</em></span><span>Reports<em>2</em></span><span>Ideas</span><span>Health</span><span>Setup</span></div>
+
+<div class="pc wait">
+<div class="pc-h"><b>storefront</b><span>software</span></div>
+<p class="pc-s"><span class="s-a">Planning with Opus</span><span class="s-b">Waiting for your OK</span></p>
+<ol class="sr">
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>Brief</li>
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>Plan</li>
+<li class="gate"><i><svg class="ico fill"><use href="#i-star"/></svg></i>OK</li>
+<li><i></i>Build</li>
+<li><i></i>Test</li>
+<li><i></i>Review</li>
+<li><i></i>Done</li>
+</ol>
+<div class="mrow"><span class="mbtn pri">Review plan</span><span class="mbtn">Ask aside</span></div>
+</div>
+
+<div class="pc">
+<div class="pc-h"><b>mobile-app</b><span>app</span></div>
+<p class="pc-s"><span class="s-a">Building with Sonnet</span><span class="s-b">Testing with Sonnet</span></p>
+<ol class="sr">
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>Brief</li>
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>Plan</li>
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>OK</li>
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>Build</li>
+<li class="next"><i></i>Test</li>
+<li><i></i>Review</li>
+<li><i></i>Done</li>
+<li class="trav" aria-hidden="true"></li>
+</ol>
+</div>
+
+<div class="pc">
+<div class="pc-h"><b>api-service</b><span>software</span></div>
+<p class="pc-s">Fixing: test failed, try 1 of 2</p>
+<ol class="sr">
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>Brief</li>
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>Plan</li>
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>OK</li>
+<li class="done"><i><svg class="ico"><use href="#i-check"/></svg></i>Build</li>
+<li class="fail"><i><svg class="ico"><use href="#i-x"/></svg></i>Test</li>
+<li><i></i>Review</li>
+<li><i></i>Done</li>
+</ol>
+</div>
+</div>
+</figure>
+</div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section id="how" class="sec" aria-labelledby="how-h">
+<div class="wrap">
+<div class="sec-head">
+<h2 id="how-h">Three steps from idea to done</h2>
+<p class="intro">You describe it, approve the plan, and the agents do the rest.</p>
+</div>
+<ol class="steps">
+<li class="step">
+<div class="step-h"><span class="step-n">1</span><h3>You describe it</h3></div>
+<p>Say what you want in plain words.</p>
+<div class="ill-w" aria-hidden="true">
+<div class="ill ill1">
+<div class="i1-box"><span class="typed">Add a checkout page</span></div>
+<span class="chip i1-out">CR-013 opened</span>
+</div>
+<p class="ill-cap">Sample</p>
+</div>
+</li>
+<li class="step">
+<div class="step-h"><span class="step-n gold">2</span><h3>The agents plan, you say OK</h3></div>
+<p>You read the plan and say yes.</p>
+<div class="ill-w" aria-hidden="true">
+<div class="ill ill2">
+<ul><li>Cart summary</li><li>Payment step</li><li>Order confirmation</li></ul>
+<span class="i2-btn"><svg class="ico fill"><use href="#i-star"/></svg>OK</span>
+</div>
+<p class="ill-cap">Sample</p>
+</div>
+</li>
+<li class="step">
+<div class="step-h"><span class="step-n">3</span><h3>It builds, tests and reviews</h3></div>
+<p>A separate verifier runs the real tests.</p>
+<div class="ill-w" aria-hidden="true">
+<ul class="ill ill3">
+<li><span>Build</span><em class="chip">Sonnet</em><i class="ck"><svg class="ico"><use href="#i-check"/></svg></i></li>
+<li><span>Test</span><em class="chip">Sonnet</em><i class="ck"><svg class="ico"><use href="#i-check"/></svg></i></li>
+<li><span>Review</span><em class="chip">Opus</em><i class="ck"><svg class="ico"><use href="#i-check"/></svg></i></li>
+</ul>
+<p class="ill-cap">Sample</p>
+</div>
+</li>
+</ol>
+
+<div class="rail-box">
+<p class="rail-cap">Every change walks seven stages.</p>
+<ol class="rail">
+<li><i><svg class="ico"><use href="#i-check"/></svg></i><span>Brief</span></li>
+<li><i><svg class="ico"><use href="#i-check"/></svg></i><span>Plan</span></li>
+<li class="you"><i><svg class="ico fill"><use href="#i-star"/></svg></i><span>Your OK</span></li>
+<li><i><svg class="ico"><use href="#i-check"/></svg></i><span>Build</span></li>
+<li><i><svg class="ico"><use href="#i-check"/></svg></i><span>Test</span></li>
+<li><i><svg class="ico"><use href="#i-check"/></svg></i><span>Review</span></li>
+<li><i><svg class="ico"><use href="#i-check"/></svg></i><span>Done</span></li>
+</ol>
+</div>
+</div>
+</section>
+
+<!-- TEAM -->
+<section id="team" class="sec alt" aria-labelledby="team-h">
+<div class="wrap">
+<div class="sec-head">
+<h2 id="team-h">Ten roles, each on the right model</h2>
+<p class="intro">The agents that do the work. Judgement goes to Opus, volume to Sonnet, short summaries to Haiku.</p>
+</div>
+<ul class="roles">
+<li class="role"><h3>Scoper</h3><p>Sets criteria before planning</p><span class="chip">Sonnet</span></li>
+<li class="role"><h3>Planner</h3><p>Plans with acceptance criteria</p><span class="chip">Opus</span></li>
+<li class="role"><h3>Designer</h3><p>Writes the UI spec</p><span class="chip">Sonnet</span></li>
+<li class="role"><h3>Builder</h3><p>Docs, scripts, config</p><span class="chip">Sonnet</span></li>
+<li class="role"><h3>Frontend builder</h3><p>Screens, styles, accessibility</p><span class="chip">Sonnet</span></li>
+<li class="role"><h3>Backend builder</h3><p>Services, APIs, data</p><span class="chip">Sonnet</span></li>
+<li class="role"><h3>Ops builder</h3><p>CI, builds, Docker</p><span class="chip">Sonnet</span></li>
+<li class="role"><h3>Verifier</h3><p>Runs the real tests</p><span class="chip">Sonnet</span></li>
+<li class="role"><h3>Reviewer</h3><p>Reviews, never edits</p><span class="chip">Opus</span></li>
+<li class="role"><h3>Reporter</h3><p>Summaries, three lines max</p><span class="chip">Haiku</span></li>
+</ul>
+</div>
+</section>
+
+<!-- CONTROL -->
+<section id="control" class="sec" aria-labelledby="ctl-h">
+<div class="wrap">
+<div class="sec-head">
+<h2 id="ctl-h">You stay in control</h2>
+<p class="intro">Plans wait for your OK. Public pushes and deploys stop and ask.</p>
+</div>
+<div class="dual">
+<article class="pane plan" id="plan-card">
+<div class="pane-h"><b>CR-013 &middot; Checkout page</b><span>Planner on Opus</span></div>
+<div class="pane-b">
+<h3 class="pane-t">The plan is ready for your OK</h3>
+<ul class="tasks">
+<li><span class="bx" aria-hidden="true"></span>Cart summary</li>
+<li><span class="bx" aria-hidden="true"></span>Payment step</li>
+<li><span class="bx" aria-hidden="true"></span>Order confirmation</li>
+</ul>
+<p class="done-msg" role="status">Approved by you. The builder starts.</p>
+</div>
+<div class="pane-f">
+<button type="button" class="btn btn-accent" data-act="approve" data-s="ask"><svg class="ico fill" aria-hidden="true"><use href="#i-star"/></svg>Approve plan</button>
+<button type="button" class="btn" data-act="reset" data-s="ok">Reset sample</button>
+</div>
+</article>
+<article class="pane stop">
+<div class="pane-h"><b>payments-api &middot; Paused</b><span>Hard stop</span></div>
+<div class="pane-b">
+<h3 class="pane-t">Autopilot wants to push publicly</h3>
+<ul class="stop-list">
+<li><svg class="ico" aria-hidden="true"><use href="#i-pause"/></svg>A public push<em>waits for you</em></li>
+<li><svg class="ico" aria-hidden="true"><use href="#i-pause"/></svg>A deploy<em>waits for you</em></li>
+</ul>
+</div>
+<div class="pane-f">
+<span class="btn btn-accent">Decide</span>
+</div>
+</article>
+</div>
+<p class="note">Sample cards. Nothing here runs.</p>
+</div>
+</section>
+
+<!-- MEMORY -->
+<section id="memory" class="sec alt" aria-labelledby="mem-h">
+<div class="wrap">
+<div class="sec-head">
+<h2 id="mem-h">A new chat picks up where you stopped</h2>
+<p class="intro">Handoff lives in plain files in your repo, with no hidden database.</p>
+</div>
+<div class="mem">
+<figure class="win tree" role="img" aria-label="A project folder: docs contains STATUS.md for where things stand, DECISIONS.md for what was decided and why, and a memory folder for facts to keep.">
+<div class="win-bar" aria-hidden="true">your-project/docs</div>
+<div class="tree-b" aria-hidden="true">
+<div class="file hot"><svg class="ico"><use href="#i-file"/></svg><code>STATUS.md</code><span>where things stand</span></div>
+<div class="file"><svg class="ico"><use href="#i-file"/></svg><code>DECISIONS.md</code><span>what was decided, and why</span></div>
+<div class="file"><svg class="ico"><use href="#i-folder"/></svg><code>memory/</code><span>facts to keep</span></div>
+</div>
+</figure>
+<div class="link" aria-hidden="true"><i></i></div>
+<figure class="win chat" aria-label="A new chat the next day reads STATUS.md and carries on from the last step.">
+<div class="win-bar" aria-hidden="true">New chat, tomorrow</div>
+<div class="chat-b" aria-hidden="true">
+<p class="bub">Reading <b>STATUS.md</b> and <b>DECISIONS.md</b></p>
+<p class="bub">Checkout is built. Next step: Test.</p>
+</div>
+</figure>
+</div>
+<p class="note">Illustrative sample. The real files are plain Markdown.</p>
+</div>
+</section>
+
+<!-- PANEL -->
+<section id="panel" class="sec" aria-labelledby="panel-h">
+<div class="wrap">
+<div class="sec-head">
+<h2 id="panel-h">One panel for every project</h2>
+<p class="intro">See what is running, what failed and what waits on you.</p>
+</div>
+<div class="tabs" data-tabs>
+<div class="tab-list" role="tablist" aria-label="Panel views">
+<button type="button" class="tab" role="tab" id="t-projects" aria-controls="p-projects" aria-selected="true">Projects<small>Now, Next, Waiting on you</small></button>
+<button type="button" class="tab" role="tab" id="t-reports" aria-controls="p-reports" aria-selected="false" tabindex="-1">Reports<small>PASS, FAIL, BLOCKED</small></button>
+<button type="button" class="tab" role="tab" id="t-timeline" aria-controls="p-timeline" aria-selected="false" tabindex="-1">Timeline<small>Releases and history</small></button>
+<button type="button" class="tab" role="tab" id="t-setup" aria-controls="p-setup" aria-selected="false" tabindex="-1">Setup<small>Ready, or what to fix</small></button>
+</div>
+<div class="tab-panels">
+
+<div class="tp on" role="tabpanel" id="p-projects" aria-labelledby="t-projects" tabindex="0">
+<figure class="win"><div class="win-bar" aria-hidden="true">Projects &middot; sample</div>
+<div class="pn">
+<div class="wl">
+<h3>Waiting on you (2)</h3>
+<ul>
+<li class="y"><b>storefront</b> Approve plan for CR-013</li>
+<li class="y"><b>payments-api</b> Autopilot wants to push</li>
+</ul>
+<h3>Now</h3>
+<ul>
+<li><b>mobile-app</b> Building with Sonnet</li>
+<li><b>api-service</b> Fixing: test failed</li>
+<li><b>docs-site</b> Reviewer is reading</li>
+</ul>
+</div>
+</div></figure>
+</div>
+
+<div class="tp" role="tabpanel" id="p-reports" aria-labelledby="t-reports" tabindex="0">
+<figure class="win"><div class="win-bar" aria-hidden="true">Reports &middot; sample</div>
+<div class="pn">
+<div class="rep-g">
+<h3>api-service</h3>
+<div class="rep"><span class="vd vd-fail"><svg class="ico" aria-hidden="true"><use href="#i-x"/></svg>FAIL</span><p><b>2 of 214 tests failed</b><br>Verifier</p><time>today</time></div>
+<h3>payments-api</h3>
+<div class="rep"><span class="vd vd-block"><svg class="ico" aria-hidden="true"><use href="#i-pause"/></svg>BLOCKED</span><p><b>Waiting for the owner</b><br>Push needs your decision</p><time>today</time></div>
+<h3>storefront</h3>
+<div class="rep"><span class="vd"><svg class="ico" aria-hidden="true"><use href="#i-check"/></svg>PASS</span><p><b>Verifier</b></p><time>yesterday</time></div>
+</div>
+</div></figure>
+</div>
+
+<div class="tp" role="tabpanel" id="p-timeline" aria-labelledby="t-timeline" tabindex="0">
+<figure class="win"><div class="win-bar" aria-hidden="true">storefront &middot; Timeline &middot; sample</div>
+<div class="pn">
+<ol class="tlv">
+<li class="cur"><time>In flight</time><b>CR-013 Checkout page</b><span>Waiting for your OK</span></li>
+<li><time>Since the last release</time><b>2 changes done</b><span>CR-011, CR-012</span></li>
+<li><time>12 Oct</time><b>Released v1.0</b><span>Tagged with <code>shipm release mark</code></span></li>
+<li><time>History</time><b>What was delivered</b><span>Every finished change</span></li>
+</ol>
+</div></figure>
+</div>
+
+<div class="tp" role="tabpanel" id="p-setup" aria-labelledby="t-setup" tabindex="0">
+<figure class="win"><div class="win-bar" aria-hidden="true">Setup &middot; sample</div>
+<div class="pn">
+<p class="set-h">Setup &middot; 2 to fix</p>
+<div class="set-rows">
+<div class="set-r todo"><span class="mk" aria-hidden="true"></span>GitHub login<em>Fix</em></div>
+<div class="set-r todo"><span class="mk" aria-hidden="true"></span>Project registry<em>Fix</em></div>
+<div class="set-r"><svg class="ico" aria-hidden="true"><use href="#i-check"/></svg>Claude Code login</div>
+<div class="set-r"><svg class="ico" aria-hidden="true"><use href="#i-check"/></svg>VS Code</div>
+<div class="set-r"><svg class="ico" aria-hidden="true"><use href="#i-check"/></svg>git, python3, node</div>
+</div>
+<div class="mrow"><span class="mbtn">Re-check</span><span class="mbtn">Details</span></div>
+</div></figure>
+</div>
+
+</div>
+</div>
+</div>
+</section>
+
+<!-- FEATURES -->
+<section id="features" class="sec alt" aria-labelledby="feat-h">
+<div class="wrap">
+<div class="sec-head">
+<h2 id="feat-h">Everything included</h2>
+<p class="intro">Seven groups. Titles first, details when you want them.</p>
+</div>
+<div class="fgrid" id="fgrid">
+<div class="fsum">
+<p class="big">44</p>
+<p class="fsum-t">features in 7 groups</p>
+<button type="button" class="tg" aria-pressed="false" data-toggle-detail><span>Show details</span></button>
+</div>
+
+<section class="fcard" aria-labelledby="g-team">
+<header><svg class="ico gi" aria-hidden="true"><use href="#i-users"/></svg><h3 id="g-team">Agents</h3><span class="count">7</span></header>
+<ul>
+<li><b>Ten named roles</b><span>Scoper to reporter, installed once.</span></li>
+<li><b>A model per role</b><span>Opus plans, Sonnet builds, Haiku summarises.</span></li>
+<li><b>A separate verifier</b><span>Tests run by another agent.</span></li>
+<li><b>Two review lenses</b><span>Correctness, or risk.</span></li>
+<li><b>An agent cap</b><span>Limits how many agents run.</span></li>
+<li><b>A team table per project</b><span>Who is on each project, in a table.</span></li>
+<li><b>Skills you approve</b><span>Pinned to a commit.</span></li>
+</ul>
+</section>
+
+<section class="fcard" aria-labelledby="g-flow">
+<header><svg class="ico gi" aria-hidden="true"><use href="#i-flow"/></svg><h3 id="g-flow">Flow and approvals</h3><span class="count">6</span></header>
+<ul>
+<li><b>Seven stages</b><span>Brief to Done.</span></li>
+<li><b>Your OK is yours</b><span>Only your own words in the chat approve a plan.</span></li>
+<li><b>Change requests</b><span>Each change gets an id: <code>shipm cr open</code>, <code>list</code>, <code>show</code>, <code>start</code>.</span></li>
+<li><b>Retry, then ask</b><span>Two failed tries, then it waits for you.</span></li>
+<li><b>A flow gate</b><span>Says what was skipped.</span></li>
+<li><b>Autopilot with a charter</b><span>Bounded runs that stop at hard stops.</span></li>
+</ul>
+</section>
+
+<section class="fcard" aria-labelledby="g-panel">
+<header><svg class="ico gi" aria-hidden="true"><use href="#i-panel"/></svg><h3 id="g-panel">VS Code panel</h3><span class="count">8</span></header>
+<ul>
+<li><b>Projects tab</b><span>Now, Next, Waiting on you.</span></li>
+<li><b>Reports tab</b><span>PASS, FAIL, BLOCKED, failures first.</span></li>
+<li><b>Ideas tab</b><span>Every project&rsquo;s ideas in one list.</span></li>
+<li><b>Health tab</b><span>Frozen chats and stuck steps.</span></li>
+<li><b>Setup tab</b><span>The <code>shipm init --check</code> list with Fix, Skip, Re-check.</span></li>
+<li><b>Timeline and releases</b><span>Last release, changes since, History.</span></li>
+<li><b>Ask aside</b><span>A side question without leaving your chat.</span></li>
+<li><b>Prefilled, never run</b><span>You read and run each command.</span></li>
+</ul>
+</section>
+
+<section class="fcard" aria-labelledby="g-mem">
+<header><svg class="ico gi" aria-hidden="true"><use href="#i-memory"/></svg><h3 id="g-mem">Memory</h3><span class="count">5</span></header>
+<ul>
+<li><b>Handoff in files</b><span><code>STATUS.md</code>, <code>DECISIONS.md</code> and <code>memory/</code> in every project.</span></li>
+<li><b>Project templates</b><span>A base plus web, iOS, Python, API, notes.</span></li>
+<li><b>One engineering standard</b><span>The same rules in every project&rsquo;s <code>CLAUDE.md</code>.</span></li>
+<li><b>An ideas list</b><span><code>docs/FEATURE-IDEAS.md</code> per project. Add with <code>shipm idea add</code>.</span></li>
+<li><b>A nudge before chats drift</b><span>A hint at 200k tokens, a strong one at 300k.</span></li>
+</ul>
+</section>
+
+<section class="fcard" aria-labelledby="g-auto">
+<header><svg class="ico gi" aria-hidden="true"><use href="#i-clock"/></svg><h3 id="g-auto">Automation</h3><span class="count">7</span></header>
+<ul>
+<li><b>An awake guard</b><span>Keeps the Mac awake for work. macOS.</span></li>
+<li><b>Awake while Claude works</b><span>Idle sleep is held off for each call.</span></li>
+<li><b>Continue at the usage limit</b><span>The Mac stays awake until the limit resets.</span></li>
+<li><b>Keep going</b><span>Claude is sent back to finish.</span></li>
+<li><b>A daily job</b><span>Every day at 09:00.</span></li>
+<li><b>A weekly tidy report</b><span>Read-only disk use per project.</span></li>
+<li><b>Long jobs with a deadline</b><span><code>shipm bg 30 -- cmd</code> ends the job when time is up.</span></li>
+</ul>
+</section>
+
+<section class="fcard" aria-labelledby="g-safe">
+<header><svg class="ico gi" aria-hidden="true"><use href="#i-shield"/></svg><h3 id="g-safe">Safety</h3><span class="count">6</span></header>
+<ul>
+<li><b>A safety gate in hooks</b><span>Each step is checked. Skips are said out loud.</span></li>
+<li><b>Hard stops</b><span>A public push or deploy waits for you.</span></li>
+<li><b>A push check</b><span>An offline pre-push guard applies your registry rules.</span></li>
+<li><b>Owner commands stay out of chat</b><span>Setup and uninstall refuse to run in a chat.</span></li>
+<li><b>Local, and masked</b><span>No network calls of its own. Secrets are masked.</span></li>
+<li><b>Hooks fail open</b><span>A missing hook shows &ldquo;gate OFF&rdquo; instead of failing.</span></li>
+</ul>
+</section>
+
+<section class="fcard" aria-labelledby="g-setup">
+<header><svg class="ico gi" aria-hidden="true"><use href="#i-term"/></svg><h3 id="g-setup">Setup</h3><span class="count">5</span></header>
+<ul>
+<li><b>Guided setup</b><span><code>shipm init</code> is safe to re-run and can be resumed.</span></li>
+<li><b>Check only</b><span><code>shipm init --check</code> and <code>shipm doctor</code> change nothing.</span></li>
+<li><b>Quick setup</b><span>Five choices in one card.</span></li>
+<li><b>macOS, Linux, WSL 2</b><span>macOS first. Linux and WSL 2 are experimental.</span></li>
+<li><b>Reversible</b><span><code>shipm uninstall</code> shows a dry run, then reverses writes.</span></li>
+</ul>
+</section>
+</div>
+</div>
+</section>
+
+<!-- INSTALL -->
+<section id="install" class="sec" aria-labelledby="inst-h">
+<div class="wrap">
+<div class="sec-head">
+<h2 id="inst-h">Install in three commands</h2>
+<p class="intro">Run them in a normal terminal, not inside a Claude chat.</p>
+</div>
+<div class="inst">
+<div class="inst-l">
+<ol class="cmds">
+<li><span>Get the code</span><div class="cmd"><pre tabindex="0"><span class="pr" aria-hidden="true">$</span><code>git clone https://github.com/alsharifabdull/shipmiracle ~/Developer/shipmiracle</code></pre><button type="button" class="copy" data-copy="git clone https://github.com/alsharifabdull/shipmiracle ~/Developer/shipmiracle" aria-label="Copy the git clone command"><svg class="ico" aria-hidden="true"><use href="#i-copy"/></svg><span class="copy-t">Copy</span></button></div></li>
+<li><span>Move in</span><div class="cmd"><pre tabindex="0"><span class="pr" aria-hidden="true">$</span><code>cd ~/Developer/shipmiracle</code></pre><button type="button" class="copy" data-copy="cd ~/Developer/shipmiracle" aria-label="Copy the cd command"><svg class="ico" aria-hidden="true"><use href="#i-copy"/></svg><span class="copy-t">Copy</span></button></div></li>
+<li><span>Run the guided setup</span><div class="cmd"><pre tabindex="0"><span class="pr" aria-hidden="true">$</span><code>./bin/shipm init</code></pre><button type="button" class="copy" data-copy="./bin/shipm init" aria-label="Copy the setup command"><svg class="ico" aria-hidden="true"><use href="#i-copy"/></svg><span class="copy-t">Copy</span></button></div></li>
+</ol>
+<p class="note">Only looking? <code>shipm init --check</code> changes nothing.</p>
+<div class="req">
+<h3 class="req-h">You need</h3>
+<ul class="chips">
+<li class="chip chip-l">macOS</li>
+<li class="chip chip-l">Linux or WSL 2 (experimental)</li>
+<li class="chip chip-l">Claude Code, Pro or Max login</li>
+<li class="chip chip-l">VS Code</li>
+<li class="chip chip-l">git, python3, node</li>
+</ul>
+</div>
+</div>
+<div class="repo">
+<p class="repo-name">alsharifabdull / <b>shipmiracle</b></p>
+<p class="repo-d">Keeps all your AI projects organized.</p>
+<p class="meta">MIT &middot; Python, JavaScript, Shell</p>
+<p class="repo-cta">
+<a class="btn btn-primary" href="https://github.com/alsharifabdull/shipmiracle" rel="noopener"><svg class="ico fill" aria-hidden="true"><use href="#i-github"/></svg>Star on GitHub</a>
+</p>
+</div>
+</div>
+</div>
+</section>
+
+<!-- FAQ -->
+<section id="faq" class="sec alt" aria-labelledby="faq-h">
+<div class="wrap">
+<div class="sec-head">
+<h2 id="faq-h">Questions</h2>
+</div>
+<div class="faq">
+<details>
+<summary>Is it really free?</summary>
+<p>Yes. MIT licensed. You need your own Claude Pro or Max plan.</p>
+</details>
+<details>
+<summary>Do I need an API key?</summary>
+<p>No. It drives Claude Code with the login you already have.</p>
+</details>
+<details>
+<summary>Does it send my code anywhere?</summary>
+<p>No. It runs on your machine, with no network calls of its own.</p>
+</details>
+<details>
+<summary>Do I still use Claude Code?</summary>
+<p>Yes. Shipmiracle works with the Claude Code you already use. It keeps your AI projects organized, with plans, approvals, memory and status for each.</p>
+</details>
+<details>
+<summary>Where does it run?</summary>
+<p>Runs locally on macOS, Linux and Windows (through WSL 2); Linux and WSL 2 are experimental.</p>
+</details>
+<details>
+<summary>Is it affiliated with Anthropic?</summary>
+<p>No. It is independent. Claude and Claude Code are Anthropic&rsquo;s products.</p>
+</details>
+</div>
+</div>
+</section>
+
+</main>
+
+<footer>
+<div class="wrap fgr">
+<div class="f-brand">
+<a class="brand" href="/" aria-label="Shipmiracle, home"><img class="logo logo-d" src="/assets/mark-only-dark.svg" alt="" width="28" height="28"><img class="logo logo-l" src="/assets/mark-only.svg" alt="" width="28" height="28"><span>Shipmiracle</span></a>
+<p>All your AI projects, organized</p>
+</div>
+<nav class="f-col" aria-label="Footer">
+<ul>
+<li><a href="#how">How it works</a></li>
+<li><a href="#team">Agents</a></li>
+<li><a href="#features">Features</a></li>
+<li><a href="#install">Install</a></li>
+<li><a href="https://github.com/alsharifabdull/shipmiracle" rel="noopener">GitHub</a></li>
+</ul>
+</nav>
+<div class="f-end">
+<p>MIT licence. No cookies, no tracking.</p>
+<p>Not affiliated with Anthropic. Claude and Claude Code are Anthropic&rsquo;s products.</p>
+</div>
+</div>
+</footer>
+</body>
+</html>

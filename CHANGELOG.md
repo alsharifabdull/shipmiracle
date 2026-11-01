@@ -3,6 +3,13 @@
 All notable changes are listed here. The format follows Keep a Changelog; versions follow Semantic Versioning
 (0.x until a stranger has installed and removed it on a clean macOS account).
 
+## 0.1.1
+
+- New positioning: shipm manages all your AI projects and keeps them organized.
+- New light header picture in the README.
+- The website source now lives in `website/`.
+- The release check accepts the website fonts.
+
 ## 0.1.0
 
 First public export.

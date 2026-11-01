@@ -1,0 +1,4 @@
+# Reviewed website fonts: '<sha256>  <path>' (sorted). A woff2 under website/assets/fonts that is not listed here, or whose hash differs, fails release-check ('unreviewed_font') until a reviewer has read it and updated this line.
+# Both files are Geist (SIL OFL, website/assets/fonts/OFL-geist.txt), header-checked 2026-11-01: reserved, metaOffset, metaLength, metaOrigLength, privOffset, privLength all 0. Regenerate: sha256sum website/assets/fonts/*.woff2
+19f9c92546aa300c312235e3125af1b81394d8db9a4bc4a425cd5b641d2d54e1  website/assets/fonts/geist-latin-wght-normal.woff2
+684ad5b531f81d43c1e8c7038262d5db7cdc1f68006e04d6c7769efa8d33c8cc  website/assets/fonts/geist-mono-latin-wght-normal.woff2

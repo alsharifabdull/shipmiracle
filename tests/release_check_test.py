@@ -257,6 +257,393 @@ for rel_ in ("docs/p.png", "docs/images/sub/p.png", "docs/images/p.gif"):
     rc, out, err = run(["release-check", "--tree", str(_img_tree("imgbad" + str(len(rel_)), rel_, _png)), "--no-denylist"])
     check("a PNG at %s is still a binary finding" % rel_, rc == 1 and "FAIL filetype kind=binary" in out, (rc, out))
 
+# animated header GIF (2026-11-01, animated GIF under docs/images): strict gif_clean rule. The GIFs are built here byte by byte with a tiny pure-python LZW encoder (CLEAR before every 2 pixels: the code width stays 3 bits).
+def _lzw(pixels):
+    codes = []
+    for k_ in range(0, len(pixels), 2):
+        codes += [4] + list(pixels[k_:k_ + 2])
+    codes.append(5)
+    acc_, nb_, out_ = 0, 0, bytearray()
+    for c_ in codes:
+        acc_ |= c_ << nb_; nb_ += 3
+        while nb_ >= 8:
+            out_.append(acc_ & 255); acc_ >>= 8; nb_ -= 8
+    if nb_:
+        out_.append(acc_ & 255)
+    return bytes(out_)
+def _sub(b_):
+    o_ = b""
+    for k_ in range(0, len(b_), 255):
+        o_ += bytes([len(b_[k_:k_ + 255])]) + b_[k_:k_ + 255]
+    return o_ + b"\0"
+_NET = b"\x21\xff\x0bNETSCAPE2.0\x03\x01\x00\x00\x00"
+def _gce(delay=10):
+    return b"\x21\xf9\x04\x00" + _st.pack("<H", delay) + b"\x00\x00"
+def _img(w, h, px, lct=False, left=0, top=0, mcs=2):
+    return b"\x2c" + _st.pack("<HHHH", left, top, w, h) + (b"\x81" if lct else b"\x00") + (b"\x00" * 12 if lct else b"") + bytes([mcs]) + _sub(_lzw(px))
+def _gif(w=4, h=2, frames=2, magic=b"GIF89a", net=_NET, pre=b"", post=b"", trailer=b"\x3b", gct=True, extra_after_img=b""):
+    d_ = magic + _st.pack("<HH", w, h) + (b"\xf1" if gct else b"\x00") + b"\x00\x00" + (bytes(range(12)) if gct else b"") + net + pre
+    for k_ in range(frames):
+        d_ += _gce() + _img(w, h, [(k_ + j_) % 4 for j_ in range(w * h)]) + extra_after_img
+    return d_ + trailer + post
+_g1, _g2 = _gif(frames=1, net=b""), _gif(frames=2)
+_PIX = [0, 1, 2, 3, 0, 1, 2, 3]
+def _mcs(m_):
+    return _g1.replace(b"\x02" + _sub(_lzw(_PIX)), bytes([m_]) + _sub(_lzw(_PIX)))
+GR = "docs/images/header.gif"
+def _gifrun(name, rel, data, mode=None):
+    t_ = _img_tree(name, rel, data)
+    if mode is not None:
+        os.chmod(str(t_ / rel), mode)
+    return run(["release-check", "--tree", str(t_), "--no-denylist"])
+check("gif: a minimal 1-frame GIF passes gif_clean and the encoder is sane", chk.gif_clean(_g1) and _g1.startswith(b"GIF89a") and _g1.endswith(b"\x3b"))
+check("gif: a 2-frame NETSCAPE2.0 loop GIF passes gif_clean", chk.gif_clean(_g2))
+check("gif: GIF87a, a local colour table and a frame inside a bigger canvas pass", chk.gif_clean(_gif(magic=b"GIF87a", frames=1, net=b"")) and chk.gif_clean(b"GIF89a" + _st.pack("<HH", 8, 8) + b"\x00\x00\x00" + _gce() + _img(4, 2, [0, 1, 2, 3, 0, 1, 2, 3], lct=True, left=4, top=6) + b"\x3b"))
+rc, out, err = _gifrun("gifok", GR, _g2)
+check("gif: a clean docs/images/header.gif passes release-check", rc == 0, (rc, out))
+rc, out, err = _gifrun("gifnogct", GR, _gif(gct=False, frames=1, net=b"", pre=b""))
+check("gif: a GIF with no colour table at all still parses (structure only)", chk.gif_clean(_gif(gct=False, frames=1, net=b"")), (rc, out))
+_bad = [("wrong magic", b"GIF90a" + _g2[6:]), ("PNG bytes in a .gif", _png), ("empty file", b""), ("magic only", b"GIF89a"),
+        ("truncated mid-frame", _g2[:len(_g2) // 2]), ("truncated before the trailer", _g2[:-1]), ("missing trailer", _gif(trailer=b"")),
+        ("a byte after the trailer", _gif(post=b"\0")), ("text after the trailer", _gif(post=b"/Users" + b"/x")), ("two trailers", _gif(post=b"\x3b")),
+        ("comment extension", _gif(pre=b"\x21\xfe\x05hello\x00")), ("plain-text extension", _gif(pre=b"\x21\x01\x0c" + b"\0" * 12 + b"\x02hi\x00")),
+        ("unknown app extension (XMP DataXMP)", _gif(net=b"\x21\xff\x0bXMP DataXMP\x03\x01\x00\x00\x00")),
+        ("NETSCAPE2.0 with a longer sub-block", _gif(net=b"\x21\xff\x0bNETSCAPE2.0\x04\x01\x00\x00\x00\x00")),
+        ("NETSCAPE2.0 whose sub-block does not start with 1", _gif(net=b"\x21\xff\x0bNETSCAPE2.0\x03\x02\x00\x00\x00")),
+        ("NETSCAPE1.0", _gif(net=b"\x21\xff\x0bNETSCAPE1.0\x03\x01\x00\x00\x00")), ("app extension with block size 10", _gif(net=b"\x21\xff\x0aNETSCAPE2.0\x03\x01\x00\x00\x00")),
+        ("two NETSCAPE extensions", _gif(net=_NET + _NET)), ("NETSCAPE after the first frame", _gif(net=b"", extra_after_img=_NET)),
+        ("graphic control extension of block size 5", _gif(pre=b"\x21\xf9\x05\x00\x0a\x00\x00\x00\x00")), ("unknown extension label 0x99", _gif(pre=b"\x21\x99\x00")),
+        ("unknown block byte 0x00", _gif(pre=b"\x00")), ("unknown block byte 0x41", _gif(pre=b"A")),
+        ("sub-block running past the end of the file", _g1[:_g1.rindex(b"\x3b") - 1] + b"\x7f\x3b"), ("LZW minimum code size 1", _mcs(1)), ("LZW minimum code size 9", _mcs(9)), ("LZW minimum code size 0", _mcs(0)),
+        ("canvas width 0", _gif(w=0, frames=1, net=b"")), ("canvas height 0", _gif(h=0, frames=1, net=b"")),
+        ("canvas width 4097", _g1[:6] + _st.pack("<H", 4097) + _g1[8:]), ("canvas height 4097", _g1[:8] + _st.pack("<H", 4097) + _g1[10:]),
+        ("frame outside the canvas", b"GIF89a" + _st.pack("<HH", 4, 2) + b"\x00\x00\x00" + _img(4, 2, [0] * 8, left=1) + b"\x3b"), ("frame of width 0", b"GIF89a" + _st.pack("<HH", 4, 2) + b"\x00\x00\x00" + _img(0, 2, [0] * 8) + b"\x3b"),
+        ("no image at all", b"GIF89a" + _st.pack("<HH", 4, 2) + b"\x00\x00\x00" + b"\x3b"), ("401 frames", _gif(w=1, h=1, frames=401)), ("a truncated header (13 bytes)", _g1[:13])]
+check("gif: the 400-frame limit is exact (400 pass)", chk.gif_clean(_gif(w=1, h=1, frames=400)))
+for nm_, d_ in _bad:
+    check("gif_clean refuses: %s" % nm_, chk.gif_clean(d_) is False)
+for nm_, d_ in ((n_, d_) for n_, d_ in _bad if n_ in ("wrong magic", "truncated mid-frame", "a byte after the trailer", "comment extension", "unknown app extension (XMP DataXMP)", "unknown block byte 0x41", "missing trailer", "canvas width 0", "401 frames")):
+    rc, out, err = _gifrun("gifbad" + str(len(d_)) + nm_[:4].replace(" ", "_"), GR, d_)
+    check("gif: a docs/images GIF with %s is a binary finding in release-check" % nm_, rc == 1 and "FAIL filetype kind=binary" in out and GR in out, (rc, out[:300]))
+check("gif_clean never raises on hostile bytes (every truncation of a good GIF is False, never an exception)", all(chk.gif_clean(_g2[:k_]) is False for k_ in range(len(_g2))))
+_junk = [bytes((k_ * 7 + j_ * 13) % 256 for j_ in range(60)) for k_ in range(40)]
+check("gif_clean on 40 pseudo-random byte strings behind a GIF89a magic returns False without raising", all(chk.gif_clean(b"GIF89a" + j_) is False for j_ in _junk))
+# size cap: 6 MB exactly passes (one big comment-free frame made of many sub-blocks), one byte more is refused by gif_clean and by release-check (too_large)
+def _padded(total):
+    base_ = b"GIF89a" + _st.pack("<HH", 1, 1) + b"\x00\x00\x00" + b"\x2c" + _st.pack("<HHHH", 0, 0, 1, 1) + b"\x00\x02"
+    body_ = total - len(base_) - 1 - 1             # trailer byte + final sub-block terminator
+    full_, rest_ = divmod(body_, 256)               # each full sub-block is 255 data + 1 length byte
+    chain_ = (b"\xff" + b"\x00" * 255) * full_
+    if rest_ >= 2:
+        chain_ += bytes([rest_ - 1]) + b"\x00" * (rest_ - 1)
+    elif rest_ == 1:
+        chain_ = chain_[:-256] + b"\xfe" + b"\x00" * 254 + b"\x01\x00" if full_ else chain_
+    return base_ + chain_ + b"\x00" + b"\x3b"
+_p6 = _padded(chk.GIF_MAX)
+check("gif: a GIF of exactly 6 MB passes gif_clean", len(_p6) == chk.GIF_MAX and chk.gif_clean(_p6), len(_p6))
+rc, out, err = _gifrun("gif6mb", GR, _p6)
+check("gif: a docs/images GIF of exactly 6 MB passes release-check (the 320 KB text limit does not apply to it)", rc == 0, (rc, out[:300]))
+_p7 = _padded(chk.GIF_MAX + 1)
+check("gif: the cap is exactly 6 MB, and 6 MB + 1 byte (otherwise a valid GIF) is refused by gif_clean", chk.GIF_MAX == 6 * 1024 * 1024 and len(_p7) == chk.GIF_MAX + 1 and chk.gif_clean(_p7) is False, len(_p7))
+rc, out, err = _gifrun("gif6mbx", GR, _p7)
+check("gif: a docs/images GIF over 6 MB is a too_large finding", rc == 1 and "FAIL filetype kind=too_large" in out, (rc, out[:300]))
+# paths: only docs/images/<name>.gif, case-sensitive, no newline, no folder below
+for rel_ in ("docs/p.gif", "docs/images/sub/p.gif", "docs/images/p.GIF", "docs/images/p.Gif", "docs/images/p.gif\n", "docs/images/p.gif ", "brand/p.gif", "website/assets/p.gif", "p.gif", "docs/images/.gif.txt"):
+    check("gif: the path %r does not match the picture exemption" % rel_, not chk.BINARY_OK.match(rel_) and not chk.GIF_OK.match(rel_) and chk.brand_image_clean(rel_, _g2) is False)
+check("gif: docs/images/header.gif and docs/images/x.gif match the exemption", bool(chk.BINARY_OK.match("docs/images/header.gif")) and chk.brand_image_clean("docs/images/x.gif", _g2))
+for rel_ in ("docs/p.gif", "docs/images/sub/p.gif", "docs/images/p.GIF", "brand/p.gif", "website/assets/p.gif"):
+    rc, out, err = _gifrun("gifpath" + str(len(rel_)) + rel_[-5:-4], rel_, _g2)
+    check("gif: a clean GIF at %s is still a finding" % rel_, rc == 1 and "FAIL" in out and rel_ in out, (rc, out[:300]))
+try:
+    rc, out, err = _gifrun("gifnl", "docs/images/p.gif\n", _g2)
+    check("gif: a file named 'p.gif<newline>' under docs/images is a binary finding", rc == 1 and "FAIL filetype kind=binary" in out, (rc, out[:300]))
+except OSError as e_:
+    print("INFO filesystem refuses a newline in a name (%s): predicate checks above cover it" % e_)
+rc, out, err = _gifrun("gifexec", GR, _g2, 0o755)
+check("gif: a clean GIF with an exec bit is an exec_bit finding", rc == 1 and "FAIL filetype kind=exec_bit" in out and GR in out, (rc, out[:300]))
+# at most 3 gifs under docs/images (dry-run guard)
+def _gif_n(name, n):
+    t_ = _img_tree(name, "docs/images/g0.gif", _g2)
+    for k_ in range(1, n):
+        (t_ / "docs" / "images" / ("g%d.gif" % k_)).write_bytes(_g2)
+    return run(["release-check", "--tree", str(t_), "--no-denylist"])
+rc, out, err = _gif_n("gif3", 3)
+check("gif: exactly 3 gifs under docs/images pass", rc == 0, (rc, out[:300]))
+rc, out, err = _gif_n("gif4", 4)
+check("gif: 4 gifs under docs/images are a too_many_gifs finding", rc == 1 and "FAIL filetype kind=too_many_gifs" in out, (rc, out[:300]))
+# a real ffmpeg GIF (when ffmpeg is installed on this machine) is accepted: this is the file the README header will be
+_ff = shutil.which("ffmpeg") or ("/opt/homebrew/bin/ffmpeg" if os.path.exists("/opt/homebrew/bin/ffmpeg") else None)
+if _ff:
+    _fd = TMP / "ffgif"; _fd.mkdir(parents=True, exist_ok=True)
+    _fr = subprocess.run([_ff, "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=64x32:d=0.2:r=10,format=rgb24", "-vf", "split[a][b];[a]palettegen[p];[b][p]paletteuse", "-loop", "0", str(_fd / "h.gif")], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    _ffd = (_fd / "h.gif").read_bytes() if _fr.returncode == 0 and (_fd / "h.gif").exists() else b""
+    check("gif: ffmpeg wrote a GIF for the test", bool(_ffd), _fr.stderr[:200])
+    check("gif: a real ffmpeg GIF (looping, palettegen) passes gif_clean", chk.gif_clean(_ffd) and b"NETSCAPE2.0" in _ffd)
+    rc, out, err = _gifrun("gifff", GR, _ffd)
+    check("gif: a real ffmpeg GIF at docs/images/header.gif passes release-check", rc == 0, (rc, out[:300]))
+    check("gif: the real ffmpeg GIF with a byte appended or a byte cut is refused", not chk.gif_clean(_ffd + b"\0") and not chk.gif_clean(_ffd[:-1]))
+else:
+    print("INFO ffmpeg is not installed here: the real-ffmpeg GIF checks are skipped (the hand-built GIFs above cover the rule)")
+
+# animated header GIF, risk review minors (2026-11-01): (1) text scan of the non-pixel bytes, (2) polyglot signatures, (3) budget and the 3-gif read stop, (4) plain picture names
+def _gif_with(payload, magic=b"GIF89a"):
+    lz_ = _lzw([0, 1, 2, 3, 0, 1, 2, 3])
+    return (magic + _st.pack("<HH", 4, 2) + b"\xf1\x00\x00" + bytes(range(12)) + _NET + _gce() + b"\x2c" + _st.pack("<HHHH", 0, 0, 4, 2) + b"\x00\x02"
+            + bytes([len(lz_)]) + lz_ + bytes([len(payload)]) + payload + b"\x00" + b"\x3b")
+check("gif minors: a GIF with an extra data sub-block of plain filler still passes gif_clean", chk.gif_clean(_gif_with(b"abcdefgh")))
+_tok = SECRETS["github_token"].encode()
+rc, j, out, err = rj(_img_tree("gifsec", GR, _gif_with(b"x " + _tok + b" y")))
+check("gif minors: a token in a data sub-block is a secrets/builtin finding on the GIF", rc == 1 and has(j, "secrets/builtin", "github_token", GR), (rc, out[:300]))
+check("   ... and the token is not printed", _tok.decode() not in out + err)
+_hp = ("/Us" + "ers/" + "realperson9/proj").encode()
+rc, j, out, err = rj(_img_tree("gifhome", GR, _gif_with(_hp)), "--no-denylist")
+check("gif minors: a home path in a data sub-block is a home-path finding", rc == 1 and has(j, "home-path", "home_path", GR), (rc, out[:300]))
+rc, j, out, err = rj(_img_tree("gifhomelx", GR, _gif_with(b"/home/" + b"realperson9/x")), "--no-denylist")
+check("gif minors: a /home/<name>/ path in a data sub-block is a home-path finding", rc == 1 and has(j, "home-path", "home_path", GR), (rc, out[:300]))
+rc, j, out, err = rj(_img_tree("gifsec2", GR, _gif_with(b"x " + SECRETS["aws_access_key"].encode())), "--no-denylist")
+check("gif minors: an AWS key in a data sub-block is found even with --no-denylist", rc == 1 and has(j, "secrets/builtin", "aws_access_key", GR), (rc, out[:300]))
+write_deny(ENTRIES)
+rc, j, out, err = rj(_img_tree("gifdeny", GR, _gif_with(b"mail " + EMAIL.encode() + b" ok")))
+check("gif minors: a denylist email in a data sub-block is an identifier finding on the GIF", rc == 1 and any(f["check"] == "identifier" and f["file"] == GR for f in j["findings"]), (rc, out[:300]))
+check("   ... and the email is not printed", EMAIL not in out + err)
+rc, j, out, err = rj(_img_tree("gifdeny0", GR, _gif_with(b"mail nobody ok")))
+check("gif minors: with a denylist and nothing hidden the GIF passes", rc == 0, (rc, out[:300]))
+_imgdir = (_OV / "docs" / "images") if (_OV / "docs" / "images").is_dir() else ROOT / "docs" / "images"      # the exported tree carries the overlay at its root
+_real_gif = _imgdir / "header.gif"
+if _real_gif.is_file():
+    _rb = _real_gif.read_bytes()
+    check("gif minors: the shipped header.gif passes gif_clean (no polyglot signature by chance)", chk.gif_clean(_rb), len(_rb))
+    rc, j, out, err = rj(_img_tree("gifreal", GR, _rb))
+    check("gif minors: the shipped header.gif has 0 findings with a synthetic denylist (no false positive on binary text)", rc == 0 and not j["findings"], (rc, out[:300]))
+else:
+    print("INFO release/overlay/docs/images/header.gif not present in this tree: the real-file check is skipped")
+for nm_, sig_ in (("zip local header", b"PK\x03\x04rest"), ("zip end record", b"PK\x05\x06" + b"\0" * 18), ("<script tag", b"<script>alert(1)</script>"), ("<SCRIPT upper case", b"<ScRiPt src=x>"),
+                  ("<html tag", b"<HTML><body>"), ("<svg tag", b"<svg onload=x>"), ("%PDF- header", b"%PDF-1.7 obj"), ("signature in the middle of a sub-block", b"abcdefgh" * 4 + b"PK\x03\x04" + b"ijklmnop")):
+    check("gif minors: a data sub-block with a %s is refused by gif_clean" % nm_, chk.gif_clean(_gif_with(sig_)) is False)
+rc, j, out, err = rj(_img_tree("gifzip", GR, _gif_with(b"PK\x03\x04rest")), "--no-denylist")
+check("gif minors: a zip polyglot GIF is a binary finding in release-check", rc == 1 and has(j, "filetype", "binary", GR), (rc, out[:300]))
+rc, j, out, err = rj(_img_tree("gifscr", GR, _gif_with(b"<script>x</script>")), "--no-denylist")
+check("gif minors: a <script GIF is a binary finding in release-check", rc == 1 and has(j, "filetype", "binary", GR), (rc, out[:300]))
+# (3) budget: a big GIF counts as its real size (up to GIF_MAX), not as 320 KB; the 4th gif is never read
+_old_budget = chk.BUDGET
+try:
+    chk.BUDGET = 1024 * 1024
+    _tb = _img_tree("gifbud", "docs/images/a.gif", _padded(2 * 1024 * 1024))
+    (_tb / "docs" / "images" / "b.png").write_bytes(_png)
+    rc, j, out, err = rj(_tb, "--no-denylist")
+    check("gif minors: a 2 MB GIF uses 2 MB of the scan budget (the next file gets scan_budget_exceeded)", rc == 1 and has(j, "filetype", "scan_budget_exceeded", "docs/images/b.png"), (rc, out[:300]))
+finally:
+    chk.BUDGET = _old_budget
+_t4 = _img_tree("gif4read", "docs/images/g0.gif", _g2)
+for k_ in (1, 2):
+    (_t4 / "docs" / "images" / ("g%d.gif" % k_)).write_bytes(_g2)
+(_t4 / "docs" / "images" / "g3.gif").write_bytes(b"not a gif at all")
+rc, j, out, err = rj(_t4, "--no-denylist")
+check("gif minors: the 4th gif is not read (only too_many_gifs, no binary finding for its garbage)", rc == 1 and any(f["kind"] == "too_many_gifs" for f in j["findings"]) and not has(j, "filetype", "binary", "docs/images/g3.gif"), (rc, out[:300]))
+# (4) plain picture names
+_ovl_names = sorted(p_.name for p_ in _imgdir.glob("*"))
+check("gif minors: every shipped README picture name matches the plain-name rule", _ovl_names and all(chk.BINARY_OK.match("docs/images/" + n_) for n_ in _ovl_names), _ovl_names)
+for nm_ in ("a b", "a\n", "a‮b", "a‏b", "a\tb", "é", "a.b", "", "a\x00b", "a⁦b"):
+    for ext_ in ("gif", "png"):
+        rel_ = "docs/images/%s.%s" % (nm_, ext_)
+        check("gif minors: the name %r is not a picture name" % rel_, not chk.BINARY_OK.match(rel_) and (ext_ != "gif" or not chk.GIF_OK.match(rel_)))
+for nm_ in ("a-b_9", "Header", "A"):
+    check("gif minors: the plain name %r is accepted" % nm_, bool(chk.BINARY_OK.match("docs/images/%s.gif" % nm_)) and bool(chk.GIF_OK.match("docs/images/%s.gif" % nm_)) and bool(chk.BINARY_OK.match("docs/images/%s.png" % nm_)))
+for nm_ in ("a‮b", "a b"):
+    rc, out, err = _gifrun("gifname" + str(len(nm_)) + nm_[1:2].encode("unicode_escape").decode()[-4:], "docs/images/%s.gif" % nm_, _g2)
+    check("gif minors: a clean GIF named %r is a binary finding in release-check" % ("docs/images/%s.gif" % nm_), rc == 1 and "FAIL filetype kind=binary" in out, (rc, out[:300]))
+    rc, out, err = run(["release-check", "--tree", str(_img_tree("pngname" + str(len(nm_)) + nm_[1:2].encode("unicode_escape").decode()[-4:], "docs/images/%s.png" % nm_, _png)), "--no-denylist"])
+    check("gif minors: a clean PNG named %r is a binary finding in release-check" % ("docs/images/%s.png" % nm_), rc == 1 and "FAIL filetype kind=binary" in out, (rc, out[:300]))
+
+# website (2026-10-31): website/assets/*.png|ico pass the strict picture rule; website/assets/fonts/*.woff2 pass only the strict WOFF2 rule (magic, header length field == real length, <= 200 KB)
+def _woff2(n=2000, length=None, magic=b"wOF2"):
+    d_ = bytearray(magic + b"\x00\x01\x00\x00" + b"\0" * 4 + b"\0" * 36 + b"\x5a" * (n - 48))
+    d_[8:12] = (n if length is None else length).to_bytes(4, "big")
+    return bytes(d_)
+def _wtree(name, rel, data, mode=None, pin=True):
+    t_ = _img_tree(name, rel, data)
+    if pin and rel.endswith(".woff2"):          # the reviewed font list travels in the tree, as in an exported tree (release/website-fonts.sha256)
+        (t_ / "release").mkdir(exist_ok=True)
+        (t_ / "release" / "website-fonts.sha256").write_text("# reviewed\n%s  %s\n" % (hashlib.sha256(data).hexdigest(), rel))
+    if mode is not None:
+        os.chmod(str(t_ / rel), mode)
+    return t_
+WF = "website/assets/fonts/f.woff2"
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2ok", WF, _woff2())), "--no-denylist"])
+check("a clean woff2 under website/assets/fonts passes release-check", rc == 0, (rc, out))
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2max", WF, _woff2(200 * 1024))), "--no-denylist"])
+check("a woff2 of exactly 200 KB passes", rc == 0, (rc, out))
+for nm_, rel_, data_ in (("wrong magic", WF, _woff2(magic=b"wOFF")), ("length field too small", WF, _woff2(length=1999)), ("length field too large", WF, _woff2(length=2001)),
+                         ("bytes appended after the declared length", WF, _woff2() + b"/Users" + b"/x"), ("over 200 KB", WF, _woff2(200 * 1024 + 1)),
+                         ("shorter than the 48-byte header", WF, b"wOF2" + b"\0" * 20), ("text content", WF, b"just text, no magic\n"),
+                         ("path outside the fonts folder (website/assets/f.woff2)", "website/assets/f.woff2", _woff2()), ("path in another website folder", "website/fonts/f.woff2", _woff2()),
+                         ("path under brand/", "brand/f.woff2", _woff2()), ("nested below the fonts folder", "website/assets/fonts/sub/f.woff2", _woff2()),
+                         ("font with another extension (.woff)", "website/assets/fonts/f.woff", _woff2())):
+    rc, out, err = run(["release-check", "--tree", str(_wtree("w2" + str(len(nm_)) + nm_[:3], rel_, data_)), "--no-denylist"])
+    check("woff2: %s is a binary finding" % nm_, rc == 1 and "FAIL filetype kind=binary" in out and rel_ in out, (rc, out))
+for rel_ in (WF + "\n", "website/assets/fonts/f.woff2\n"):
+    check("woff2 rule refuses the name %r (trailing newline) and the predicate agrees" % rel_, not chk.WOFF2_OK.match(rel_))
+    try:
+        rc, out, err = run(["release-check", "--tree", str(_wtree("w2nl", rel_, _woff2())), "--no-denylist"])
+        check("a font file named 'f.woff2<newline>' is a binary finding", rc == 1 and "FAIL filetype kind=binary" in out, (rc, out))
+    except OSError as e_:
+        print("INFO filesystem refuses a newline in a name (%s): predicate check above covers it" % e_)
+check("woff2_clean: accepts a good file, refuses empty / magic-only", chk.woff2_clean(_woff2()) and not chk.woff2_clean(b"") and not chk.woff2_clean(b"wOF2"))
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2exec", WF, _woff2(), 0o755)), "--no-denylist"])
+check("a woff2 with an exec bit is an exec_bit finding", rc == 1 and "FAIL filetype kind=exec_bit" in out and WF in out, (rc, out))
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2rt", "website/index.html", "<p>x</p>\n".encode(), 0o755)), "--no-denylist"])
+check("a website html file with an exec bit is an exec_bit finding (EXEC_OK does not cover website/)", rc == 1 and "FAIL filetype kind=exec_bit" in out and not chk.EXEC_OK.match("website/index.html"), (rc, out))
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2png", "website/assets/p.png", _png)), "--no-denylist"])
+check("a clean website/assets PNG passes", rc == 0, (rc, out))
+for nm_, data_ in (("tEXt chunk", _png[:_i] + _ch(b"tEXt", b"k\0" + b"/Users" + b"/x") + _png[_i:]), ("bytes after IEND", _png + b"/Users" + b"/x")):
+    rc, out, err = run(["release-check", "--tree", str(_wtree("w2png" + nm_[:3], "website/assets/p.png", data_)), "--no-denylist"])
+    check("a website/assets PNG with %s is a binary finding" % nm_, rc == 1 and "FAIL filetype kind=binary" in out and "website/assets/p.png" in out, (rc, out))
+_ico = b"\x00\x00\x01\x00\x01\x00" + _st.pack("<BBBBHHII", 1, 1, 0, 0, 1, 32, len(_png), 22) + _png
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2ico", "website/assets/favicon.ico", _ico)), "--no-denylist"])
+check("a clean website/assets ICO passes", rc == 0, (rc, out))
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2icox", "website/assets/favicon.ico", _ico + b"/Users" + b"/x")), "--no-denylist"])
+check("a website/assets ICO with trailing bytes is a binary finding", rc == 1 and "FAIL filetype kind=binary" in out, (rc, out))
+for rel_ in ("website/p.png", "website/assets/sub/p.png", "website/assets/p.gif", "website/assets/p.png\n"):
+    check("a PNG at %r does not match the picture exemption" % rel_, not chk.BINARY_OK.match(rel_))
+for rel_ in ("website/p.png", "website/assets/sub/p.png", "website/assets/p.gif"):
+    rc, out, err = run(["release-check", "--tree", str(_wtree("w2bad" + str(len(rel_)), rel_, _png)), "--no-denylist"])
+    check("a PNG at %s is still a binary finding" % rel_, rc == 1 and "FAIL filetype kind=binary" in out, (rc, out))
+_txt = {"website/index.html": "<p>hi</p>\n", "website/styles.css": "a{b:c}\n", "website/site.js": "var a=1;\n", "website/assets/m.svg": "<svg/>\n", "website/CNAME": "x.example\n",
+        "website/robots.txt": "User-agent: *\n", "website/404.html": "<p>no</p>\n", "website/assets/fonts/OFL-geist.txt": "licence\n", "website/README.md": "readme\n"}
+rc, out, err = run(["release-check", "--tree", str(tree("w2txt", _txt)), "--no-denylist"])
+check("the website text files (html, css, js, svg, txt, CNAME) pass as text", rc == 0, (rc, out))
+
+# ---- website hardening (2026-11-01, risk review of the website export): strict woff2 header, raw-byte scan, sha256 pin, exact names, svg, home paths.
+# Fake secrets and sensitive file names are built from pieces at run time: no token-looking or credential-file literal is in this file.
+import struct as _s2
+_GHP = "gh" + "p_" + "A1b2C3d4" * 4 + "Zz9Y"                 # 36 chars after the prefix
+_AKIA = "AK" + "IA" + "ABCDEFGHIJKLMNOP"
+_ANT = "sk-" + "ant-" + "api03-" + "x" * 12
+_UHOME = "/Users" + "/realperson/Dev"
+_LHOME = "/ho" + "me/realperson/dev/"
+_DOT = "."
+
+
+def _w2(payload=b"", reserved=0, meta_off=0, meta_len=0, meta_orig=0, priv_off=0, priv_len=0):
+    n_ = 48 + len(payload)
+    return b"wOF2" + _s2.pack(">IIHHIIHHIIIII", 0x10000, n_, 1, reserved, 1, 1, 1, 0, meta_off, meta_len, meta_orig, priv_off, priv_len) + payload
+
+
+def _kinds(out_, kind, rel):
+    return ("kind=%s" % kind) in out_ and rel in out_
+
+
+def _listed(t_, rel, data):
+    (t_ / "release").mkdir(exist_ok=True)
+    (t_ / "release" / "website-fonts.sha256").write_text("%s  %s\n" % (hashlib.sha256(data).hexdigest() if data is not None else "0" * 64, rel))
+
+
+check("woff2_clean: a header with reserved, meta and priv fields all 0 is accepted", chk.woff2_clean(_w2(b"\x5a" * 100)))
+for fld_ in ("reserved", "meta_off", "meta_len", "meta_orig", "priv_off", "priv_len"):
+    d_ = _w2(b"\x5a" * 100, **{fld_: 7})
+    check("woff2_clean refuses a header with %s non-zero" % fld_, not chk.woff2_clean(d_))
+    rc, out, err = run(["release-check", "--tree", str(_wtree("w2h-" + fld_, WF, d_)), "--no-denylist"])
+    check("woff2 with %s non-zero is a binary finding (no unscanned meta or private block)" % fld_, rc == 1 and _kinds(out, "binary", WF), (rc, out))
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2pin-ok", WF, _w2(b"\x5a" * 100))), "--no-denylist"])
+check("a strict-header font with a clean body and a listed hash passes", rc == 0, (rc, out))
+# a token or a home path inside the body of a header-correct, PINNED font is still a finding (the scan does not depend on the pin)
+for nm_, body_, chk_, kind_ in (("github token", b"x " + _GHP.encode() + b" y", "secrets/builtin", "github_token"), ("aws key", b"x " + _AKIA.encode(), "secrets/builtin", "aws_access_key"),
+                                ("anthropic key", b"x " + _ANT.encode(), "secrets/builtin", "anthropic_key"), ("macOS home path", b"x " + _UHOME.encode() + b" y", "home-path", "home_path"),
+                                ("linux home path", b"x " + _LHOME.encode(), "home-path", "home_path")):
+    d_ = _w2(b"\x5a" * 50 + body_ + b"\x5a" * 50)
+    check("the probe font for %s has a correct header and length field" % nm_, chk.woff2_clean(d_))
+    rc, out, err = run(["release-check", "--tree", str(_wtree("w2body" + nm_[:4] + nm_[-3:], WF, d_)), "--no-denylist", "--json"])
+    j_ = json.loads(out) if out.strip().startswith("{") else {}
+    check("woff2 body holding a %s is a %s/%s finding on the font" % (nm_, chk_, kind_), rc == 1 and any(f["check"] == chk_ and f["kind"] == kind_ and f["file"] == WF for f in j_.get("findings", [])), (rc, out[:400]))
+    check("   ... and the matched text is not printed", not any(x in out + err for x in (_GHP, _AKIA, _ANT, "realperson")))
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2ph", WF, _w2(b"\x5a" * 50 + b"/Users" + b"/x/ " + b"\x5a" * 50))), "--no-denylist"])
+check("a placeholder home path (/Users/x/) inside a font is not a finding, like in text", rc == 0, (rc, out))
+# the hash pin
+d_ = _w2(b"\x5a" * 100)
+rc, out, err = run(["release-check", "--tree", str(_wtree("w2nolist", WF, d_, pin=False)), "--no-denylist"])
+check("a woff2 with no reviewed list at all is an unreviewed_font finding (fail closed)", rc == 1 and _kinds(out, "unreviewed_font", WF), (rc, out))
+t_ = _wtree("w2wronghash", WF, d_, pin=False); _listed(t_, WF, None)
+rc, out, err = run(["release-check", "--tree", str(t_), "--no-denylist"])
+check("a woff2 whose hash is not the listed one is an unreviewed_font finding", rc == 1 and _kinds(out, "unreviewed_font", WF), (rc, out))
+t_ = _wtree("w2otherpath", WF, d_, pin=False); _listed(t_, "website/assets/fonts/other.woff2", d_)
+rc, out, err = run(["release-check", "--tree", str(t_), "--no-denylist"])
+check("the right hash listed for another path does not review this font", rc == 1 and _kinds(out, "unreviewed_font", WF), (rc, out))
+t_ = _wtree("w2changed", WF, d_, pin=False); _listed(t_, WF, _w2(b"\x5b" * 100))
+rc, out, err = run(["release-check", "--tree", str(t_), "--no-denylist"])
+check("a font that changed after review (same structure, other bytes) is an unreviewed_font finding", rc == 1 and _kinds(out, "unreviewed_font", WF), (rc, out))
+try:
+    chk.parse_fixtures("bad\n", "website-fonts.sha256"); _msg = ""
+except Exception as e_:
+    _msg = str(e_)
+check("a malformed reviewed list is refused and the error names website-fonts.sha256 and the line", "website-fonts.sha256 line 1" in _msg, _msg)
+t_ = _wtree("w2badlist", WF, d_, pin=False); (t_ / "release").mkdir(); (t_ / "release" / "website-fonts.sha256").write_text("not a list\n")
+try:
+    rc, out, err = run(["release-check", "--tree", str(t_), "--no-denylist"])
+    check("a malformed website-fonts.sha256 in the tree never passes release-check", rc != 0, (rc, out))
+except ShipmiracleError as e_:
+    check("a malformed website-fonts.sha256 in the tree never passes release-check", "website-fonts.sha256" in str(e_), e_)
+# the real shipped fonts: strict header, listed, hash equal, and a tree made of the real website/ plus the real list is clean for every website rule
+_rw = ROOT / "website"
+_rl = ROOT / "release" / "website-fonts.sha256"
+_fonts = sorted((_rw / "assets" / "fonts").glob("*.woff2")) if _rw.is_dir() else []
+if _fonts and _rl.is_file():
+    _list = chk.parse_fixtures(_rl.read_text(), "website-fonts.sha256")
+    check("the shipped fonts all pass woff2_clean (reserved, meta and priv fields 0)", all(chk.woff2_clean(f.read_bytes()) for f in _fonts), [f.name for f in _fonts])
+    check("the reviewed font list names exactly the shipped fonts with their current sha256", _list == {"website/assets/fonts/" + f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in _fonts}, _list)
+    _t = TMP / "trees" / "realsite"; shutil.rmtree(str(_t), ignore_errors=True); shutil.copytree(str(_rw), str(_t / "website")); (_t / "release").mkdir(); shutil.copy(str(_rl), str(_t / "release" / "website-fonts.sha256"))
+    rc, out, err = run(["release-check", "--tree", str(_t), "--no-denylist", "--json"])
+    _j = json.loads(out) if out.strip().startswith("{") else {}
+    _bad = [(f["check"], f["kind"], f["file"]) for f in _j.get("findings", []) if f["file"] and f["file"].startswith(("website/", "release/")) and f["check"] in ("filetype", "secrets/builtin", "home-path", "legacy_name", "fixtures")]
+    check("the real website/ folder with the real font list: no filetype, secret, home-path or font finding", _bad == [], _bad)
+else:
+    print("SKIP real website fonts (website/ or release/website-fonts.sha256 is not in this tree)")
+
+# website/: exact names only (website_unknown), defence in depth for the exported tree
+OKNAMES = ["website/index.html", "website/404.html", "website/styles.css", "website/site.js", "website/theme.js", "website/robots.txt", "website/CNAME", "website/README.md",
+           "website/assets/favicon.svg", "website/assets/og-social-preview.png", "website/assets/favicon.ico", "website/assets/fonts/geist-latin-wght-normal.woff2", "website/assets/fonts/OFL-geist.txt"]
+check("each allowlisted website name matches the check-side name rule", all(chk.WEBSITE_OK.match(n_) for n_ in OKNAMES), [n_ for n_ in OKNAMES if not chk.WEBSITE_OK.match(n_)])
+BADNAMES = ["website/" + _DOT + "ht" + "access", "website/" + _DOT + "ht" + "passwd", "website/" + _DOT + "np" + "mrc", "website/" + _DOT + "DS_Store", "website/" + _DOT + "well-known/x.html",
+            "website/assets/" + _DOT + "hidden.png", "website/site.js.map", "website/styles.css.map", "website/SITE.JS.MAP",
+            "website/deploy.sh", "website/Deploy.SH", "website/bin.dat", "website/notes.txt", "website/index.htm", "website/index.HTML", "website/sub/index.html", "website/assets/sub/p.png", "website/assets/fonts/F.WOFF2",
+            "website/assets/fonts/x.woff", "website/assets/fonts/OFL.txt", "website/assets/x.gif", "website/assets/x.webp", "website/" + _DOT + "html", "website/index.html.bak", "website/x y.html", "website/index.html ", "website/index.html\n",
+            "website/CNAME.bak", "website/readme.md", "website/assets/x.svg\n", "website/assets/x.PNG"]
+check("the check-side name rule refuses every unknown, hidden, map, script, data, nested or wrong-case name", not [n_ for n_ in BADNAMES if chk.WEBSITE_OK.match(n_)], [n_ for n_ in BADNAMES if chk.WEBSITE_OK.match(n_)])
+for n_ in BADNAMES:
+    try:
+        rc, out, err = run(["release-check", "--tree", str(tree("wu" + hashlib.sha1(n_.encode()).hexdigest()[:8], {n_: "x\n"})), "--no-denylist"])
+    except OSError as e_:
+        print("INFO filesystem refuses the name %r (%s): predicate check above covers it" % (n_, e_)); continue
+    check("website_unknown finding for %r" % n_, rc == 1 and _kinds(out, "website_unknown", n_.rstrip(" \n")), (rc, out))
+rc, out, err = run(["release-check", "--tree", str(tree("wu-none", {"website/index.html": "<p>x</p>\n", "docs/notes.txt": "x\n", _DOT + "hidden": "x\n"})), "--no-denylist"])
+check("the website name rule applies under website/ only (other folders and dotfiles elsewhere are not website_unknown)", "website_unknown" not in out, (rc, out))
+_all_ok = {n_: ("<p>x</p>\n" if n_.endswith(".html") else "x\n") for n_ in OKNAMES if not n_.endswith((".png", ".ico", ".woff2"))}
+rc, out, err = run(["release-check", "--tree", str(tree("wu-allok", _all_ok)), "--no-denylist"])
+check("every allowlisted text name passes release-check with no website_unknown", rc == 0 and "website_unknown" not in out, (rc, out))
+
+# svg under website/ is a picture, not a program
+SVG_BAD = {"script element": '<svg xmlns="http://www.w3.org/2000/svg"><script>x()</script></svg>\n', "SCRIPT upper case": '<svg><SCRIPT>x()</SCRIPT></svg>\n',
+           "javascript: url": '<svg><a xlink:href="JavaScript:x()"><rect/></a></svg>\n', "onload attribute": '<svg onload="x()"></svg>\n', "ONERROR attribute": '<svg><image ONERROR = "x()"/></svg>\n',
+           "onclick attribute": '<svg><rect onclick="x()"/></svg>\n', "foreignObject": '<svg><foreignObject><div/></foreignObject></svg>\n'}
+for nm_, body_ in SVG_BAD.items():
+    rc, out, err = run(["release-check", "--tree", str(tree("svg" + nm_[:5], {"website/assets/x.svg": body_})), "--no-denylist"])
+    check("an SVG with a %s is an svg_active finding" % nm_, rc == 1 and _kinds(out, "svg_active", "website/assets/x.svg"), (rc, out))
+rc, out, err = run(["release-check", "--tree", str(tree("svg-ok", {"website/assets/x.svg": '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><path d="M0 0h8v8z" fill="#123"/><text font-family="x">icon</text></svg>\n'})), "--no-denylist"])
+check("a plain SVG passes", rc == 0, (rc, out))
+rc, out, err = run(["release-check", "--tree", str(tree("svg-else", {"docs/x.svg": '<svg onload="x()"/>\n'})), "--no-denylist"])
+check("the svg rule is for website/ (an SVG elsewhere is not an svg_active finding)", "svg_active" not in out, (rc, out))
+
+# home paths in website text: /home/<name>/ and ~<name>
+HW = {"linux home path": "see " + _LHOME + "x\n", "linux home path, upper case": "see /HO" + "ME/RealPerson/x\n", "tilde user": "ask ~" + "realperson for it\n", "tilde user with path": "cp ~" + "realperson/x y\n"}
+for nm_, body_ in HW.items():
+    rc, out, err = run(["release-check", "--tree", str(tree("hw" + nm_[:6] + str(len(nm_)), {"website/README.md": body_})), "--no-denylist", "--json"])
+    j_ = json.loads(out) if out.strip().startswith("{") else {}
+    check("website text with a %s is a home_path finding at README.md:1" % nm_, rc == 1 and any(f["check"] == "home-path" and f["kind"] == "home_path" and f["file"] == "website/README.md" and f["line"] == 1 for f in j_.get("findings", [])), (rc, out[:300]))
+    check("   ... and the name is not printed", "realperson" not in (out + err).lower())
+rc, out, err = run(["release-check", "--tree", str(tree("hw-ok", {"website/README.md": "run ~/x or $HOME/x, see /home/x/y and ~you, ~3 min, a~b, ~/.config, https://a.example/~x\n", "website/styles.css": "a~b{c:d}\nh1 ~ p{e:f}\n"})), "--no-denylist"])
+check("website text with ~/, $HOME, ~3, a~b, a placeholder (/home/x/, ~you) and CSS siblings has no home-path finding", rc == 0, (rc, out))
+rc, out, err = run(["release-check", "--tree", str(tree("hw-out", {"tests/x_test.py": "p = '/home/u/dev' + '~u'\n", "docs/a.md": "/home/someone2/x ~someone2\n"})), "--no-denylist"])
+check("outside website/ the linux home path and ~name stay allowed (the shipped tests use /home/u/ as a fake path)", rc == 0 and "FAIL home-path" not in out, (rc, out))
+
 # ------------------------------------------------------------------ 3. home-path
 U = "/Users" + "/"
 t = tree("home", {"a.md": FILLER + "see " + U + "realperson/Developer\n", "b.md": "ok " + U + "example/x " + U + "<owner>/y " + U + "$USER/z " + U + "x/ " + U + "someone/",
@@ -717,7 +1104,9 @@ rcli.PROVIDER = None
 LOGIN = "zqlogin88x"
 LOGIN_DENY = [("handle", LOGIN), ("user", LOGIN), ("project", PROJECT)]
 OK_FILES = ["LICENSE", ".github/CODEOWNERS", ".github/ISSUE_TEMPLATE/config.yml", "README.md"]
-check("login exemption table: exactly the four files the owner decided, each with its decision reference", sorted(chk.LOGIN_EXEMPT) == sorted(OK_FILES) and all("D1" in v and "2026-10-" in v for v in chk.LOGIN_EXEMPT.values()), chk.LOGIN_EXEMPT)
+check("login exemption table: exactly the four D1 files plus website/index.html (DECISIONS 2026-10-31), each with its decision reference",
+      sorted(chk.LOGIN_EXEMPT) == sorted(OK_FILES + ["website/index.html"]) and all(("D1" in v and "2026-10-" in v) or k == "website/index.html" for k, v in chk.LOGIN_EXEMPT.items())
+      and chk.LOGIN_EXEMPT["website/index.html"] == "DECISIONS 2026-10-31, owner: website links to the public repo" and not any(k.startswith("website/") and k != "website/index.html" for k in chk.LOGIN_EXEMPT), chk.LOGIN_EXEMPT)
 write_deny(LOGIN_DENY)
 t = tree("login-ok", dict((f, "Copyright (c) 2026 %s\n" % LOGIN) for f in OK_FILES))
 rc, j, out, err = rj(t)
@@ -740,6 +1129,19 @@ write_deny([("handle", LOGIN), ("user", "otheruser99"), ("project", PROJECT)])
 t = tree("login-other", {"LICENSE": "otheruser99\n"})
 rc, j, out, err = rj(t)
 check("a different user value is not exempt even in LICENSE", has(j, "identifier", "user", "LICENSE", 1), (rc, out[:300]))
+write_deny(LOGIN_DENY)
+t = tree("login-web-ok", {"website/index.html": '<a href="https://github.com/%s/x">repo</a>\n' % LOGIN})
+rc, j, out, err = rj(t)
+check("the login is allowed in website/index.html (handle and user entries): 0 identifier findings, value not printed", not [f for f in (j or {}).get("findings", []) if f["check"] == "identifier"] and LOGIN not in out, (rc, out[:400]))
+webbad = {"website/site.js": 'var u="%s";\n' % LOGIN, "website/404.html": "<p>%s</p>\n" % LOGIN, "website/theme.js": "// %s\n" % LOGIN, "website/styles.css": "/* %s */\n" % LOGIN,
+          "website/README.md": "%s\n" % LOGIN, "website/assets/index.html": "%s\n" % LOGIN, "website/sub/index.html": "%s\n" % LOGIN, "website/index.html.bak": "%s\n" % LOGIN}
+t = tree("login-web-bad", webbad)
+rc, j, out, err = rj(t)
+check("the login in any other website file (site.js, 404.html, theme.js, styles.css, README.md, nested or renamed index.html) is still a finding", rc == 1 and all(has(j, "identifier", "user", f, 1) for f in webbad), [(f["file"], f["kind"]) for f in (j or {}).get("findings", [])])
+t = tree("login-web-other", {"website/index.html": "<p>otheruser99</p>\n"})
+write_deny([("handle", LOGIN), ("user", LOGIN), ("name", "otheruser99"), ("project", PROJECT)])
+rc, j, out, err = rj(t)
+check("website/index.html exempts the login only: a name entry in the same file is still a finding", has(j, "identifier", "name", "website/index.html", 1), [(f["file"], f["kind"]) for f in (j or {}).get("findings", [])])
 write_deny([("handle", LOGIN), ("user", LOGIN), ("name", LOGIN)])
 t = tree("login-name", {"LICENSE": LOGIN + "\n"})
 rc, j, out, err = rj(t)
