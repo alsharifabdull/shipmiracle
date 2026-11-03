@@ -93,7 +93,7 @@ d = abs(T.median(play_b) - T.median(legacy_b)) * 1000
 print("INFO PreToolUse Bash: median legacy %.0f ms, playbook %.0f ms (difference %.1f ms)" % (T.median(legacy_b) * 1000, T.median(play_b) * 1000, d))
 # noise between two engines that run the same code here: <= max(3 ms, 0.25 x a bare python start measured right now, same load). (The old comparison mixed ms with seconds.) 0.25 = 3 ms / ~12-20 ms quiet.
 _sp = max(T.spawn_ref(7), T.spawn_ref(7)) * 1000
-check("PreToolUse Bash: median difference between the engines <= max(3 ms, 0.25 x bare python start %.0f ms) (noise)" % _sp, d <= max(3.0, 0.25 * _sp), d)
+check("PreToolUse Bash: median difference between the engines <= max(3 ms x CI factor %g, 0.25 x bare python start %.0f ms) (noise)" % (T.CI_FACTOR, _sp), d <= max(3.0 * T.CI_FACTOR, 0.25 * _sp), d)   # CI_FACTOR: 3 on GitHub (CI=true), 1 on a Mac; only the absolute 3 ms is widened
 
 p.cleanup()
 print("\n%s: %d failed" % ("FAIL" if fails else "ALL PASS", fails))

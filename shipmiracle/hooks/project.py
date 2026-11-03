@@ -415,8 +415,8 @@ def session_start(ctx):
     90 days, else its table rows); the change-request brief when .shipmiracle/work.json exists; the closing rules. Returns None when the folder is not there.
     Fails open: a git, status-extract or playbook error only drops that section. It runs for a project only when core.project_owned("session_start") says so
     (the project is registered and its settings no longer name session-start.sh), and the global dispatcher must register SessionStart for it to be called
-    at all (`shipm project hooks-global` keeps the template entry until it does). The skills-review line keeps the script's quirk: its backticked command ran
-    as an empty command in bash, so "the lead runs  and proposes" has two spaces; tests/hooks_project_test.py compares it with the script."""
+    at all (`shipm project hooks-global` keeps the template entry until it does). The skills-review line names the command in backticks (the script escapes them;
+    unescaped they ran as a command in bash, 2 Nov 2026 fix); tests/hooks_project_test.py compares it with the script."""
     pd = _dir(ctx)
     if pd is None:
         return None
@@ -503,7 +503,7 @@ def session_start(ctx):
         say()
         say(">>> FIRST TASK THIS SESSION: the project skills review has not been done. Before other work, follow")
         say("    docs/SKILLS.md 'How the review works' (create it from templates/base/docs/SKILLS.md in the Shipmiracle engine folder if missing):")
-        say("    the lead runs  and proposes the skills each role needs, asks the owner once, installs only what is approved.")   # the script's backticks ran an empty command
+        say("    the lead runs `npx skills find <topic>` and proposes the skills each role needs, asks the owner once, installs only what is approved.")
     elif int(ctx.now) - int(os.lstat(sk).st_mtime) >= 91 * 86400:                                                              # find -mtime +90
         say()
         say("Note: docs/SKILLS.md was last reviewed over 90 days ago; offer the owner a skills re-check.")

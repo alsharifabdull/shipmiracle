@@ -21,7 +21,7 @@ sk=docs/SKILLS.md
 if [[ ! -f "$sk" ]] || grep -qiE '^Skills review: *not done' "$sk"; then
   echo; echo ">>> FIRST TASK THIS SESSION: the project skills review has not been done. Before other work, follow"
   echo "    docs/SKILLS.md 'How the review works' (create it from templates/base/docs/SKILLS.md in the Shipmiracle engine folder if missing):"
-  echo "    the lead runs `npx skills find <topic>` and proposes the skills each role needs, asks the owner once, installs only what is approved."
+  echo "    the lead runs \`npx skills find <topic>\` and proposes the skills each role needs, asks the owner once, installs only what is approved."
 elif [[ -n "$(find "$sk" -mtime +90 2>/dev/null)" ]]; then
   echo; echo "Note: docs/SKILLS.md was last reviewed over 90 days ago; offer the owner a skills re-check."
 else

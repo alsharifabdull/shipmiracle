@@ -1,7 +1,7 @@
 """shipmiracle: the small stdlib-only core of the Shipmiracle (Python 3.9). Errors carry the CLI exit code."""
 from __future__ import annotations
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 
 class ShipmiracleError(Exception):

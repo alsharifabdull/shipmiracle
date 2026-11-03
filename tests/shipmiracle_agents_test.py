@@ -62,11 +62,24 @@ OLD = {p.stem: p.read_bytes() for p in sorted(LEGACY_DIR.glob("*.md"))}
 NEW = {p.stem: p.read_bytes() for p in sorted((ROOT / "agents" / "claude").glob("*.md"))}
 
 
+def rm_tree(path):
+    """shutil.rmtree that survives a background process (the product's detached maintenance run) still removing its own file, e.g. state/maintenance.lock, while the folder is being emptied: retry, the folder is test scratch."""
+    for _ in range(6):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            if not os.path.exists(path):
+                return
+            time.sleep(0.2)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def make_ws(path, versions=2):
     """A workspace repo whose history holds the old masters (`versions` committed versions each) and then the ten new ones."""
     path = pathlib.Path(path)
     if path.exists():
-        shutil.rmtree(path)
+        rm_tree(path)
     (path / "agents" / "claude").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(path)], env=GENV, check=True)
     git(path, "config", "user.email", "t@example.com"); git(path, "config", "user.name", "T")
@@ -88,7 +101,7 @@ def make_ws(path, versions=2):
 def make_project(name, agents_files=None, extra=None):
     d = DEV / name
     if d.exists():
-        shutil.rmtree(d)
+        rm_tree(d)
     d.mkdir(parents=True)
     subprocess.run(["git", "init", "-q", str(d)], env=GENV, check=True)
     git(d, "config", "user.email", "t@example.com"); git(d, "config", "user.name", "T")
@@ -110,7 +123,7 @@ def agent_text(name, role="build", model="sonnet", extra_fm="", turns=20, desc="
 def reset_env():
     for d in (STATE, TMP / "cfg", HOME):
         if d.exists():
-            shutil.rmtree(d)
+            rm_tree(d)
     HOME.mkdir(parents=True)
     config._cache.clear()
 
@@ -871,7 +884,7 @@ rc, out, err = cli("agents", "install")
 check("CLI install prints the diff first, then installs", rc == 0 and out.index("changes to install:") < out.index("installed:") and "+v2" in out, (rc, out[:300], err))
 # no git
 ng = TMP / "nogit"
-if ng.exists(): shutil.rmtree(ng)
+if ng.exists(): rm_tree(ng)
 (ng / "agents" / "claude").mkdir(parents=True)
 for n, b in NEW.items(): (ng / "agents" / "claude" / (n + ".md")).write_bytes(b)
 reset_env()
@@ -882,7 +895,7 @@ check("CLI dry run without git history prints the frozen legacy set line", rc ==
 # shallow clone
 reset_env(); make_ws(WS)
 sh = TMP / "shallow"
-if sh.exists(): shutil.rmtree(sh)
+if sh.exists(): rm_tree(sh)
 subprocess.run(["git", "clone", "-q", "--depth", "1", "file://" + str(WS), str(sh)], env=GENV, check=True)
 res = agents.install(dry_run=True, ws=sh)
 check("install: a shallow clone is warned about and its legacy set is still the full frozen set", any("shallow" in w for w in res["warnings"]) and len(res["legacy"]) == 11, (res["warnings"], res["legacy"]))

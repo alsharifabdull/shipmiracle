@@ -43,8 +43,9 @@ if [[ $valid == 0 ]]; then echo "shipm-chat: bad or missing chat name (letters, 
 if [[ ! -x "$CLAUDE" ]]; then echo "shipm-chat: claude not found (expected at ~/.local/bin/claude)" >&2; exit 127; fi
 args=()
 if [[ $fresh == 0 ]]; then
-  # one '-' per character (Claude Code's folder naming), whatever locale the terminal was started with
-  key="$(pwd -P | LC_ALL=en_US.UTF-8 /usr/bin/sed 's/[^A-Za-z0-9]/-/g')"
+  # one '-' per character (Claude Code's folder naming), whatever locale the terminal was started with. The letters are listed one by one, not as ranges: in en_US.UTF-8 on Linux
+  # (GNU sed) a range like a-z contains accented letters, so a folder called "é" would keep its letter and miss its history.
+  key="$(pwd -P | LC_ALL=en_US.UTF-8 /usr/bin/sed 's/[^abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]/-/g')"
   if compgen -G "$PROJECTS/$key/*.jsonl" >/dev/null 2>&1; then args+=(--continue); fi
 fi
 args+=(--model opusplan --name "$name" --remote-control "$name")

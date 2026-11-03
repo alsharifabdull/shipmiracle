@@ -239,12 +239,11 @@ echo "Shared memory"
 MAIN_WS="$WS"; WT=""   # in a git worktree the links point into the MAIN checkout: resolve it through the git common dir
 gc=$(git -C "$WS" rev-parse --path-format=absolute --git-common-dir 2>/dev/null); gd=$(git -C "$WS" rev-parse --path-format=absolute --git-dir 2>/dev/null)
 if [[ -n "$gc" && -n "$gd" && "$gc" != "$gd" && "$(basename "$gc")" == ".git" ]]; then MAIN_WS="$(cd "$gc/.." && pwd -P)"; WT=" (worktree: main checkout $MAIN_WS)"; fi
-for f in "$HOME/.claude/CLAUDE.md"; do
-  lt="$(readlink "$f" 2>/dev/null)"
-  if [[ "$lt" == "$WS/memory/GLOBAL.md" ]]; then ok "$f → memory/GLOBAL.md"
-  elif [[ -n "$WT" && "$lt" == "$MAIN_WS/memory/GLOBAL.md" ]]; then ok "$f → memory/GLOBAL.md$WT"
-  else bad "$f not linked to the shared memory → sync-tools"; fi
-done
+f="$HOME/.claude/CLAUDE.md"   # one file (a for loop over one quoted word is SC2066)
+lt="$(readlink "$f" 2>/dev/null)"
+if [[ "$lt" == "$WS/memory/GLOBAL.md" ]]; then ok "$f → memory/GLOBAL.md"
+elif [[ -n "$WT" && "$lt" == "$MAIN_WS/memory/GLOBAL.md" ]]; then ok "$f → memory/GLOBAL.md$WT"
+else bad "$f not linked to the shared memory → sync-tools"; fi
 # memlink-end
 if [[ -f "$WS/memory/GLOBAL.md" ]]; then n=$(wc -l < "$WS/memory/GLOBAL.md" | tr -d ' '); [[ $n -le 120 ]] && ok "GLOBAL.md $n lines" || warn "GLOBAL.md is $n lines (keep under 120: move detail into topic files)"
 else ok "no global memory in this install"; fi
@@ -260,7 +259,7 @@ else warn "bin/shipm missing or not executable"; fi
 echo "Skills and agents"
 # only lines whose packs column (4th) contains "global" are installed for the user; pack skills (web...) are installed per project
 glob_lines() { grep -E '^- [^(]' "$WS/skills/APPROVED.md" | awk -F'|' '{p=$4; gsub(/ /,"",p); n=split(p,a,","); for(i=1;i<=n;i++) if(a[i]=="global"){print; break}}'; }
-miss=0; while IFS='|' read -r pkg skill why packs; do pkg=$(echo "${pkg#- }"|xargs); skill=$(echo "$skill"|xargs); [[ -n "$pkg" && -n "$skill" && "$skill" != "*" ]] || continue
+miss=0; while IFS='|' read -r pkg skill _why _packs; do pkg=$(echo "${pkg#- }"|xargs); skill=$(echo "$skill"|xargs); [[ -n "$pkg" && -n "$skill" && "$skill" != "*" ]] || continue
   [[ -d "$HOME/.agents/skills/$skill" || -d "$HOME/.claude/skills/$skill" ]] || { miss=$((miss+1)); bad "approved skill $skill not installed → skills-sync"; }
 done < <(glob_lines)
 [[ $miss -eq 0 ]] && ok "approved global skills installed ($(glob_lines | wc -l | tr -d ' ') listed)"

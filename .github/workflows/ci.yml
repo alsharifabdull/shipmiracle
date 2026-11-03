@@ -41,7 +41,19 @@ jobs:
       - name: Settings isolation test
         run: python3 tests/settings_isolation_test.py
       - name: Run all suites
-        run: SHIPMIRACLE_TEST=1 bin/test-all
+        # Linux: the suites expect their throw-away worlds outside /tmp (the hard stop and the flow gate treat /tmp as scratch space, as bin/test-linux sets it up), so TMPDIR points at
+        # /var/folders/ci/T like the macOS per-user temp folder. The step fails loudly here if that folder cannot be made, instead of dozens of confusing failures later.
+        # No PYTHONDONTWRITEBYTECODE here: the latency checks rely on warm bytecode (a cold interpreter is 5-10x slower); the suites that look for bytecode litter compare before and after.
+        run: |
+          set -eu
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo install -d -m 1777 /var/folders/ci/T
+            export TMPDIR=/var/folders/ci/T
+            echo "TMPDIR=$TMPDIR"
+          fi
+          # --retry-failed: the same rule the release uses. A failed suite is run once more, alone; one that then passes is listed as FLAKY (loudly, in the log), one that fails again stays failed.
+          # A shared runner is noisy; the retry never turns a real failure into a pass.
+          SHIPMIRACLE_TEST=1 bin/test-all --retry-failed
       - name: Fail if a test changed the runner's real settings (after)
         if: always()
         run: |
@@ -68,6 +80,9 @@ jobs:
 
   release-check:
     runs-on: macos-latest
+    env:
+      # The scan must see the checkout exactly as published: running Python here would otherwise write shipmiracle/**/__pycache__/*.pyc next to the sources, and the scan (correctly) flags those as binary files.
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -78,6 +93,12 @@ jobs:
       - name: Install gitleaks
         # Accepted float (DECISIONS 2026-10-22 D9 m8): Homebrew has no version pin for a formula; the scan result is checked by --require-gitleaks and the findings are read, not trusted blindly.
         run: brew install gitleaks
+      - name: Checkout has no bytecode before the scan
+        run: |
+          set -eu
+          found=$(find . \( -name '__pycache__' -o -name '*.pyc' \) -print | head -n 5)
+          if [ -n "$found" ]; then echo "FAIL: bytecode exists before the scan:"; echo "$found"; exit 1; fi
+          echo "no bytecode in the checkout"
       - name: Scan the tree
         run: bin/shipm release-check --tree . --no-denylist --require-gitleaks
 

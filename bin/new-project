@@ -39,7 +39,7 @@ case "$name" in __proto__|constructor|prototype) echo "'$name' is a reserved nam
 # The projects folder: config paths.projects_dir (~/... follows $HOME; an absolute path is used only for the real account home), else ~/Developer.
 real_home=$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
 pd=$("$WS/bin/shipm" config get paths.projects_dir 2>/dev/null || true); DEVDIR="$HOME/Developer"
-case "$pd" in "~/"?*) DEVDIR="$HOME/${pd#\~/}";; /?*) [[ "$HOME" == "$real_home" ]] && DEVDIR="$pd";; esac
+case "$pd" in \~/?*) DEVDIR="$HOME/${pd#\~/}";; /?*) [[ "$HOME" == "$real_home" ]] && DEVDIR="$pd";; esac
 ENGINE=$("$WS/bin/shipm" config get engine.dir 2>/dev/null || true); { [[ -n "$ENGINE" && "$ENGINE" != null ]] || ENGINE="$WS"; }
 [[ -d "$DEVDIR/$name" && -f "$DEVDIR/$name/CLAUDE.md" ]] && echo "note: $name already exists; adding only missing files."
 case "$playbook" in ""|none|software|app|content|research|ops|notes) ;; *) echo "unknown playbook type: $playbook (software, app, content, research, ops, notes, none)" >&2; exit 2;; esac

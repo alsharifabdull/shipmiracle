@@ -386,8 +386,12 @@ def run_suite(impl, hook):
                                     ("Edit", dict(SRC, file_path=str(w.p.P / "docs/skills.md"))), ("MultiEdit", {"file_path": "docs/SKILLS.md", "edits": []}),
                                     ("Write", {"file_path": str(w.p.P / "docs/../docs/SKILLS.md"), "content": "x"}))):
         o = w.pre(tool, ti, "builder-a", sid="t%d" % n, aid="t%d" % n)
+        if os.path.basename(ti.get("file_path", "")) == "skills.md" and sys.platform != "darwin":
+            # docs/skills.md is the table only where the file system ignores case (macOS: the gate folds case there). On a case-sensitive file system (Linux) it is another file: not the table, no refusal.
+            check(T("tamper: on a case-sensitive file system docs/skills.md is a different file (no team refusal)"), not deny(o), o)
+            continue
         check(T("tamper: member builder-a may not %s %s" % (tool, os.path.basename(ti.get("file_path", "")))), deny(o) and "may not change the project team" in reason(o), o)
-    check(T("tamper: event team_table_write"), len(w.events("team_table_write")) >= 5, w.events())
+    check(T("tamper: event team_table_write"), len(w.events("team_table_write")) >= (5 if sys.platform == "darwin" else 4), w.events())
     for n, c in enumerate(("echo x >> docs/SKILLS.md", "sed -i s/a/b/ docs/SKILLS.md", "echo {} > .agents/borrowed.json", "tee docs/SKILLS.md", "cp /tmp/x docs/SKILLS.md", "rm docs/SKILLS.md",
                            "shipm team add db-helper --role build --why x", "./shipm team add db-helper --role build --why x", "python3 -m shipmiracle team add db-helper --role build --why x",
                            "shipm 'team' \"add\" db-helper", "shipm borrow record ecc:agent:x --reason y --as z")):

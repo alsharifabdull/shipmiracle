@@ -1,6 +1,9 @@
 // Chat health against a stand-in for VS Code: chats are found by their process, stale ones (dead IDE port) are closed or relaunched safely.
 // Run: node tests/chat_health_test.js
 require('./shipmiracle_isolation').apply();   // test isolation: fresh HOME/SHIPMIRACLE_HOME/CONFIG/STATE unless already temp
+// This suite checks the macOS branch of the chat lookup (scripted `ps eww` and `lsof` tables). On another OS the extension correctly takes its Linux branch (no environment is ever read, so a
+// stale chat is "unknown" and nothing is closed): that branch has its own checks in tests/ext_host_test.js. Here the platform is declared to be macOS, as the Python suites do with SHIPMIRACLE_FAKE_OS.
+if (process.platform !== 'darwin') Object.defineProperty(process, 'platform', { value: 'darwin' });
 const Module = require('module'), path = require('path'), os = require('os'), fs = require('fs');
 const IDE = fs.mkdtempSync('/tmp/shipmiracle-ide-'); fs.writeFileSync(path.join(IDE, '28820.lock'), JSON.stringify({ pid: process.pid }));   // the live IDE connection
 const ST = fs.mkdtempSync('/tmp/shipmiracle-st-'); process.env.SHIPMIRACLE_TEST = '1'; process.env.SHIPMIRACLE_EXT_STATE = ST; process.env.SHIPMIRACLE_IDE_DIR = IDE; process.env.SHIPMIRACLE_HEAL_MS = '0'; process.env.SHIPMIRACLE_FIX_WAIT_SCALE = '0';

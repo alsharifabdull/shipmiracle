@@ -5,6 +5,9 @@
 // Re-baselined again 31 Oct 2026 (fix/setup-checkbtn, panel 0.5.2): the Setup tab's "Check again" is now the standard .btn and Details a button.lnk (setupx.js CSS, panel.js Setup markup only); the body markup of all 26 pages was verified byte-identical to main 09b0fa8 (style and script stripped) before re-recording.
 // Run: node tests/ext_timeline_test.js
 require('./shipmiracle_isolation').apply();
+// The panel prints clock times in the machine's own time zone ("back 16:00"), which is right for the owner and wrong for a golden hash: the recording was made at UTC+3 and CI machines run at UTC.
+// So the zone is pinned here, before any Date is built (a fixed-offset zone: no daylight-saving surprise on any date).
+process.env.TZ = 'Etc/GMT-3';
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
 const FIXED = Date.UTC(2026, 9, 30, 12, 0, 0);                         // the clock is frozen so "2 h ago" never changes between runs
 const realNow = Date.now; Date.now = () => FIXED;

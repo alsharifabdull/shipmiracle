@@ -3,6 +3,12 @@
 All notable changes are listed here. The format follows Keep a Changelog; versions follow Semantic Versioning
 (0.x until a stranger has installed and removed it on a clean macOS account).
 
+## 0.1.2
+
+- CI now passes on GitHub's runners: shell script fixes (a session-start hint that ran a command by mistake, a few shellcheck findings).
+- Tests no longer assume the developer's Mac: time zone, temp folder, git identity, account name and case-sensitive file systems are handled; timing limits are wider only when `CI=true`.
+- The release scan runs on a clean checkout (no bytecode files are written before it).
+
 ## 0.1.1
 
 - New positioning: shipm manages all your AI projects and keeps them organized.

@@ -161,6 +161,8 @@ with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as fak
 # ---- about sanitising for CLAUDE.md, and the name rule shared with the panel
 with tempfile.TemporaryDirectory() as home:
     h = pathlib.Path(home); (h / "Developer").mkdir()
+    # the product runs git with a clean environment (no GIT_AUTHOR_*), so the commit identity must come from the HOME's own .gitconfig; a Mac guesses one, a CI runner has none
+    (h / ".gitconfig").write_text("[user]\n\tname = T\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n")
     env = dict(os.environ, HOME=home, GIT_AUTHOR_NAME="T", GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="T", GIT_COMMITTER_EMAIL="t@example.com", GIT_CONFIG_GLOBAL=os.devnull)
     def run3(*a):
         return subprocess.run([TOOL, *a, "--no-github"], env=env, capture_output=True, text=True, timeout=120)
@@ -257,6 +259,8 @@ with tempfile.TemporaryDirectory() as home:
 # ---- playbook step: real shipm in the temp sandbox, then a fake shipm that records the call (mapping, --playbook override, fail-soft)
 with tempfile.TemporaryDirectory() as home:
     h = pathlib.Path(home); (h / "Developer").mkdir()
+    # the product runs git with a clean environment (no GIT_AUTHOR_*), so the commit identity must come from the HOME's own .gitconfig; a Mac guesses one, a CI runner has none
+    (h / ".gitconfig").write_text("[user]\n\tname = T\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n")
     env = dict(os.environ, HOME=home, GIT_AUTHOR_NAME="T", GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="T", GIT_COMMITTER_EMAIL="t@example.com",
                GIT_CONFIG_GLOBAL=os.devnull, SHIPMIRACLE_TEST="1", SHIPMIRACLE_HOME=home, SHIPMIRACLE_DEV=home + "/Developer", SHIPMIRACLE_CONFIG=home + "/cfg", SHIPMIRACLE_STATE=home + "/state")
     env.pop("CLAUDECODE", None)
@@ -308,6 +312,8 @@ PI_MSG = "Prettier: ignore .shipmiracle (generated playbook)"
 check("the web template ships a .prettierignore that already holds the line", (WS / "templates" / "web" / ".prettierignore").read_text() == ".shipmiracle/\n")
 with tempfile.TemporaryDirectory() as home:
     h = pathlib.Path(home); (h / "Developer").mkdir()
+    # the product runs git with a clean environment (no GIT_AUTHOR_*), so the commit identity must come from the HOME's own .gitconfig; a Mac guesses one, a CI runner has none
+    (h / ".gitconfig").write_text("[user]\n\tname = T\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n")
     env = dict(os.environ, HOME=home, GIT_AUTHOR_NAME="T", GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="T", GIT_COMMITTER_EMAIL="t@example.com",
                GIT_CONFIG_GLOBAL=os.devnull, SHIPMIRACLE_TEST="1", SHIPMIRACLE_HOME=home, SHIPMIRACLE_DEV=home + "/Developer", SHIPMIRACLE_CONFIG=home + "/cfg", SHIPMIRACLE_STATE=home + "/state")
     env.pop("CLAUDECODE", None)
@@ -356,6 +362,8 @@ with tempfile.TemporaryDirectory() as home:
 # ---- a fake HOME without SHIPMIRACLE_TEST: the playbook (like the registry) is not written, a note says how
 with tempfile.TemporaryDirectory() as home:
     h = pathlib.Path(home); (h / "Developer").mkdir()
+    # the product runs git with a clean environment (no GIT_AUTHOR_*), so the commit identity must come from the HOME's own .gitconfig; a Mac guesses one, a CI runner has none
+    (h / ".gitconfig").write_text("[user]\n\tname = T\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n")
     env = dict(os.environ, HOME=home, GIT_AUTHOR_NAME="T", GIT_AUTHOR_EMAIL="t@example.com", GIT_COMMITTER_NAME="T", GIT_COMMITTER_EMAIL="t@example.com", GIT_CONFIG_GLOBAL=os.devnull)
     for k in ("SHIPMIRACLE_TEST", "SHIPMIRACLE_HOME", "SHIPMIRACLE_CONFIG", "SHIPMIRACLE_STATE", "SHIPMIRACLE_DEV", "CLAUDECODE"): env.pop(k, None)
     r = subprocess.run([TOOL, "fakepb", "--type", "web", "--no-github", "--no-open"], env=env, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)

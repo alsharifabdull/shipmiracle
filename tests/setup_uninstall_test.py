@@ -610,6 +610,9 @@ for i in range(19):
     rc, out = pty_sigint(delay)
     outcomes.add(rc)
     honest = ("Traceback" not in out) and ((rc == 0) or (rc == 130 and ((STOPPED in out) or ("Nothing was deleted. Run shipm uninstall --apply again." in out and F.diff(noise(inited), noise(F.snapshot(*ALL))) == []))))
+    # A signal that lands after the run has finished and its handler has been put back (the last output line is already printed) ends the process with the default action: exit status -SIGINT
+    # (130 in a shell). Nothing is left half-done then (the checks below still demand the finished tree and an empty manifest), so that single outcome counts as honest; before the finish line it does not.
+    honest = honest or (rc == -signal.SIGINT and "All steps reversed." in out and "Traceback" not in out)
     rc2, out2 = cli_uni()
     if not (honest and rc2 == 0 and F.diff(noise(REF), noise(F.snapshot(*ALL))) == [] and not manifest.load()["steps"]):
         bad.append((delay, rc, out[-200:], rc2, out2[-200:]))

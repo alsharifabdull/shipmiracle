@@ -3,7 +3,13 @@ A latency check must not fail just because the Mac is busy, and must still catch
   an attempt PASSES when  value <= max(limit, K * reference)   (reference = the same kind of work measured right before, on the same machine, same load)
   the check PASSES when any of 3 attempts passes. It FAILS only when the value exceeds BOTH the absolute limit AND K x reference in ALL 3 attempts.
 The failure text prints every attempt: value, reference, limit and K."""
-import subprocess, sys, time
+import os, subprocess, sys, time
+
+# CI factor: GitHub's shared runners (CI=true is set by GitHub Actions) are 2-4x slower and far noisier than the owner's Mac, and no check can tell a slow runner from a slow product by one clock reading.
+# So on CI only the ABSOLUTE millisecond limits are multiplied by 3. Everything relative stays as strict as on a Mac (value <= k x a baseline measured on the same machine, the 4x slowed-down mutants
+# that every relative check must still catch), and so do sizes, counts and memory. On a developer machine (CI unset) the factor is 1: nothing changes.
+CI_FACTOR = 3.0 if os.environ.get("CI") == "true" else 1.0
+
 
 def median(xs):
     s = sorted(xs); return s[len(s) // 2]
@@ -22,6 +28,7 @@ def spawn_ref(n=15, stat=median, cmd=None):
 def robust(measure, ref, limit, k, attempts=3):
     """measure() and ref() return seconds (floats). Returns (ok, report, best_value)."""
     rows = []
+    limit = limit * CI_FACTOR
     for _ in range(attempts):
         r = ref(); v = measure()
         rows.append((v, r))
@@ -37,6 +44,7 @@ def robust_around(measure, ref, limit, k, attempts=5):
     fails only when ALL attempts exceed both. K is chosen per test as about limit / (the reference on a quiet machine), so a quiet machine behaves like the absolute limit and a
     loaded one gets proportionally more room. Returns (ok, report, best_value)."""
     rows = []
+    limit = limit * CI_FACTOR
     for _ in range(attempts):
         r0 = ref(); v = measure(); r1 = ref(); r = max(r0, r1)
         rows.append((v, r))
@@ -62,7 +70,7 @@ def slowed(fn, delay):
 def mutant_noticed(one, ref, limit, k, n=30, factor=4.0):
     """True when robust_around() FAILS for `one` (the code under test, a callable) made artificially slower by a sleep of factor x max(limit, k x baseline): the relative check
     still catches a real regression however loaded the machine is (the delay is sized from the baseline measured right now)."""
-    delay = factor * max(limit, k * ref())
+    delay = factor * max(limit * CI_FACTOR, k * ref())
     ok, _rep, _best = robust_around(lambda: p95_of(slowed(one, delay), n), ref, limit, k, attempts=2)
     return not ok
 

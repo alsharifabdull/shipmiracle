@@ -122,8 +122,22 @@ for label, mk in (("missing shipmiracle/", lambda c: None), ("shipmiracle/ with 
     check("guarded import (%s): the script itself still runs (status)" % label, r.returncode == 0 and '"x": 1' in r.stdout, r.stdout + r.stderr[-300:])
 # no literal account name in bin/ (derived at test time)
 me = pwd.getpwuid(os.getuid()).pw_name
-hits = [str(f.relative_to(ws)) for f in (ws / "bin").iterdir() if f.is_file() and not f.is_symlink() and me.encode() in f.read_bytes()]
-check("no literal account name (%s) in any file of bin/" % me, not hits, str(hits))
+# A generic account name is an ordinary English word, not a person: GitHub's CI runs as "runner", containers as "root" / "ubuntu" / "user", and each of those words legitimately appears in
+# bin/ ("test runner", "root", "user"). Only a name that cannot be mistaken for a word is searched for. The scan is a function so that the regression check below can prove that it still
+# catches a real-looking login.
+GENERIC_ACCOUNTS = {"runner", "root", "admin", "administrator", "ubuntu", "user", "users", "ci", "build", "builder", "github", "jenkins", "vagrant", "docker", "node", "nobody", "test", "tester", "guest", "default", "daemon", "sandbox"}
+def account_hits(name, folder):
+    return [f.name for f in sorted(folder.iterdir()) if f.is_file() and not f.is_symlink() and name.encode() in f.read_bytes()]
+if me.lower() in GENERIC_ACCOUNTS or len(me) < 5:
+    print("SKIP literal account name check for the real login %r (a generic name is an ordinary word); the scan is proven on a synthetic login right below" % me)
+else:
+    hits = account_hits(me, ws / "bin")
+    check("no literal account name (%s) in any file of bin/" % me, not hits, str(hits))
+_probe = tmp / "acct-probe"; _probe.mkdir()
+(_probe / "clean").write_text("#!/bin/sh\necho the test runner, as root\n"); (_probe / "leaky").write_text("#!/bin/sh\nOWNER=jordan-example-login\n")
+check("account scan regression: a real-looking login in a bin/ file is caught, a generic word is not a finding",
+      account_hits("jordan-example-login", _probe) == ["leaky"] and account_hits("runner", _probe) == ["clean"] and account_hits("zzz-no-such-login", _probe) == [])
+check("account scan regression: the names CI users and containers have are all treated as words", {"runner", "root", "ubuntu", "admin", "user"} <= GENERIC_ACCOUNTS)
 # admin-setup text uses the account name from the password database
 r = subprocess.run([sys.executable, str(ws / "bin/shipm-guard"), "admin-setup"], capture_output=True, text=True, env=dict(os.environ, SHIPMIRACLE_STATE=str(tmp)))
 check("admin-setup prints the sudoers line for the pwd account", r.returncode == 0 and f"{me} ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1" in r.stdout, r.stdout + r.stderr)
@@ -156,6 +170,10 @@ try:
     check("reload: the change is logged once with the old and new code hash", sum("reload pid=%d" % pid_before in l for l in ev_lines()) == 1)
     os.environ.pop(g.CARRY_ENV, None)
     # broken new file: not loaded, logged once (and not again on the next loops)
+    # (this test itself loads bin/shipm-guard through a SourceFileLoader at the top, which writes bin/__pycache__ wherever bytecode writing is on, e.g. GitHub's runners:
+    #  so the check compares before / after the reload checks instead of demanding that the folder never exists)
+    pyc_now = lambda: sorted(str(x) for x in list(tmp.rglob("*.pyc")) + list((ws / "bin").rglob("*.pyc")))
+    pyc_before = pyc_now()
     _calls.clear(); EV.unlink()
     reset_reload(cand, hashlib.sha256(src).hexdigest()[:12])
     cand.write_bytes(src + b"\ndef (:\n")
@@ -165,7 +183,7 @@ try:
     cand.write_bytes(src + b"\ndef (:  # still broken, different bytes\n")
     g.reload_check(G)
     check("reload: a different broken version is logged again, still never loaded", sum("does not compile" in l for l in ev_lines()) == 2 and not _calls)
-    check("reload: no .pyc litter next to the checked file", not list(tmp.glob("__pycache__")) and not (ws / "bin/__pycache__").exists())
+    check("reload: no .pyc litter next to the checked file (no bytecode file appeared beside it or in the engine's bin/ while the reload checks ran)", pyc_now() == pyc_before and not list(tmp.glob("__pycache__")))
     cand.write_bytes(src + b"\n# fixed\n")
     check("reload: the fixed file loads", g.reload_check(G) == "reloading" and len(_calls) == 1)
     os.environ.pop(g.CARRY_ENV, None)
